@@ -1,0 +1,30 @@
+name: Backlog Check
+
+on:
+  push:
+    paths:
+      - "BACKLOG.md"
+      - "COMPLETED.md"
+      - "spikes/**"
+      - "tools/**"
+      - ".github/workflows/backlog.yml"
+  pull_request:
+    paths:
+      - "BACKLOG.md"
+      - "COMPLETED.md"
+      - "spikes/**"
+      - "tools/**"
+      - ".github/workflows/backlog.yml"
+
+jobs:
+  check-backlog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check backlog conventions
+        run: python tools/check_backlog.py
+      - name: Run checker unit tests
+        run: python -m unittest discover -s tools
