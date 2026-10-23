@@ -118,7 +118,8 @@ Behind the scenes, the rules keep concurrent sessions from colliding:
 * **Session-sized scope:** Entry bodies stay under `--max-lines` (default `45` non-blank lines).
 * **Tier & ID integrity:** Entries sit under the `## Tier N` section matching their `TN.x` ID. Duplicate IDs, retired `(formerly TN.x)` IDs, and IDs already closed in `COMPLETED.md` are rejected.
 * **Status consistency:** Every entry has a `**Status:**` line whose emoji glyph (`📋`, `🚧`, `💡`, `⏸️`) matches its summary-table row. Items marked `✅ Completed` in `BACKLOG.md` fail the check until moved to `COMPLETED.md`.
-* **Link & ledger validation:** Summary-table anchors match their Markdown headings, `spikes/...` links point to existing files, and `COMPLETED.md` maintains sequential `## N.` milestones with matching `[§N](#...)` index links.
+* **Link & ledger validation:** Summary-table anchors match their Markdown headings, `spikes/...` links point to existing files, and `COMPLETED.md` maintains sequential `## N.` milestones with matching `[§N](#...)` index links. Each number must follow the one before it, so when two sessions take the same next `§N`, the collision is reported once rather than shifting every later milestone.
+* **Adopting it with an existing ledger:** if your `COMPLETED.md` predates the checker, add `<!-- backlog-check: legacy-through=N -->` to it. Milestones `§N` and earlier are exempt from the ledger rules (numbering, heading ID, index line, double closure) but their IDs still count as closed, so history stays put and everything after `§N` is checked in full.
 
 ---
 
