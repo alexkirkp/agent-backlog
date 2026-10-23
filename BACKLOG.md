@@ -1,4 +1,4 @@
-# Development Todo List & Engineering Backlog
+# Development Backlog
 
 This document tracks active development tasks, research spikes and planned enhancements for this
 project. It is strictly organized by priority:
@@ -26,11 +26,11 @@ project. It is strictly organized by priority:
 * **Tier reflects current priority, not history.** Highest-impact/daily-use work belongs in
   Tier 1, occasional/niche work toward Tier 3. When priority changes, move the entry and
   renumber its ID to match its new tier, keeping the old ID in the status line for provenance
-  (e.g. `(formerly T3.4)`).
-* **IDs are `T<tier>.<n>` and never reused.** Take the next free number in the tier, counting
+  (e.g. `(formerly B3.4)`).
+* **IDs are `B<tier>.<n>` and never reused.** Take the next free number in the tier, counting
   IDs already in [`COMPLETED.md`](COMPLETED.md) (running `python tools/check_backlog.py` prints
   the next free ID in each tier and the next `§N` milestone number). Lettered chunks (below) add
-  a suffix: `T1.1a`, `T1.1b`.
+  a suffix: `B1.1a`, `B1.1b`.
 * **The summary table is the work queue: top row first.** The backlog is worked top-down, so row
   order is the execution order. Order by priority, then by dependency: an entry that unblocks or
   must land before another sits above it (if that crosses a tier, re-tier the blocker upward).
@@ -45,7 +45,7 @@ project. It is strictly organized by priority:
   files or subsystems that don't need to land together, split it into separate IDs/tier slots
   rather than one oversized entry.
 * **Work bigger than one session becomes lettered chunks.** It keeps one number, and each
-  chunk takes a letter: `T1.1a`, `T1.1b`, …. Each chunk gets its own row and entry, is sized
+  chunk takes a letter: `B1.1a`, `B1.1b`, …. Each chunk gets its own row and entry, is sized
   to one session, and is ordered by dependency in the table. Background the chunks share goes
   in `spikes/<id>_<slug>.md` instead of being repeated in each entry. Chunks move to
   `COMPLETED.md` one at a time as they land. When the last one lands, add an umbrella closure
@@ -61,7 +61,7 @@ project. It is strictly organized by priority:
 ### Entry template
 
 ```markdown
-### T2.7. Short Imperative Title
+### B2.7. Short Imperative Title
 * **Status:** 📋 **Planned** (YYYY-MM-DD: where the item came from)
 * **Model Fit:** <tier> (<one-line reason>)
 * **Why it matters:** the problem, who hits it, and the evidence.
@@ -111,9 +111,9 @@ Map these tiers to whichever models and agents your team runs.
 
 | ID | Task Name | Focus Area | Status | Model Fit | Target Surface / Script |
 |:---:|---|---|:---:|:---:|---|
-| **T0.1** | [Run the Backlog Checker in CI](#t01-run-the-backlog-checker-in-ci) | Repository Hygiene | 📋 Planned | **Workhorse** | `.github/workflows/`, `tools/check_backlog.py` |
-| **T1.1a** | [Give the Shared HTTP Client Timeouts and Retries](#t11a-give-the-shared-http-client-timeouts-and-retries) | Reliability | 📋 Planned | **Workhorse** | `src/http_client.*`, its tests |
-| **T1.1b** | [Route Every Outbound HTTP Call Through the Shared Client](#t11b-route-every-outbound-http-call-through-the-shared-client) | Reliability | 📋 Planned | **Fast** | call sites that build requests directly |
+| **B0.1** | [Run the Backlog Checker in CI](#b01-run-the-backlog-checker-in-ci) | Repository Hygiene | 📋 Planned | **Workhorse** | `.github/workflows/`, `tools/check_backlog.py` |
+| **B1.1a** | [Give the Shared HTTP Client Timeouts and Retries](#b11a-give-the-shared-http-client-timeouts-and-retries) | Reliability | 📋 Planned | **Workhorse** | `src/http_client.*`, its tests |
+| **B1.1b** | [Route Every Outbound HTTP Call Through the Shared Client](#b11b-route-every-outbound-http-call-through-the-shared-client) | Reliability | 📋 Planned | **Fast** | call sites that build requests directly |
 
 ---
 
@@ -126,7 +126,7 @@ Completed milestones have moved out of this file entirely. The full index and wr
 
 ---
 
-### T0.1. Run the Backlog Checker in CI
+### B0.1. Run the Backlog Checker in CI
 * **Status:** 📋 **Planned** (example entry: delete or replace it once you've read it)
 * **Model Fit:** Workhorse (a small workflow file and one verification run)
 * **Why it matters:** the conventions above only hold if something enforces them. Agents editing
@@ -146,13 +146,13 @@ Completed milestones have moved out of this file entirely. The full index and wr
 
 ---
 
-### T1.1a. Give the Shared HTTP Client Timeouts and Retries
-* **Status:** 📋 **Planned** (example entry, chunk 1 of 2 of T1.1: a lettered set split from one
+### B1.1a. Give the Shared HTTP Client Timeouts and Retries
+* **Status:** 📋 **Planned** (example entry, chunk 1 of 2 of B1.1: a lettered set split from one
   task too big for a session)
 * **Model Fit:** Workhorse (a contained change to one module with careful tests)
 * **Why it matters:** outbound calls hang for minutes when an upstream service stalls, and a
   single 429 or 503 surfaces to users as a hard failure. The project has a shared HTTP client
-  module, but it has no default timeout and doesn't retry, so moving callers onto it (T1.1b)
+  module, but it has no default timeout and doesn't retry, so moving callers onto it (B1.1b)
   would gain nothing yet.
 * **End goal:** every request through the shared client has a default timeout. Idempotent
   requests retry with backoff on connection errors, 429 and 5xx, and honor `Retry-After`.
@@ -163,10 +163,10 @@ Completed milestones have moved out of this file entirely. The full index and wr
 
 ---
 
-### T1.1b. Route Every Outbound HTTP Call Through the Shared Client
-* **Status:** 📋 **Planned** (example entry, chunk 2 of 2 of T1.1)
-* **Model Fit:** Fast (mechanical call-site swaps once T1.1a has set the behavior)
-* **Depends on:** T1.1a. Moving callers before the client retries would only spread its gaps.
+### B1.1b. Route Every Outbound HTTP Call Through the Shared Client
+* **Status:** 📋 **Planned** (example entry, chunk 2 of 2 of B1.1)
+* **Model Fit:** Fast (mechanical call-site swaps once B1.1a has set the behavior)
+* **Depends on:** B1.1a. Moving callers before the client retries would only spread its gaps.
 * **Why it matters:** code written before the shared client existed builds requests directly,
   with its own ad hoc timeouts or none. Each of those is a place where a fix to the client
   (a retry policy, an auth header, logging) doesn't reach.

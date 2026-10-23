@@ -7,11 +7,11 @@ checks them. This script fails (exit 1) when:
 * a summary-table row has no body entry, a body entry has no row, or a table row is malformed;
 * body entries are not in the same order as the table (the table is the work queue);
 * an entry body runs over the line cap (default 45 non-blank lines);
-* an entry sits under a `## Tier N` section that doesn't match its `TN.x` ID;
+* an entry sits under a `## Tier N` section that doesn't match its `BN.x` ID;
 * an ID appears twice, was retired via `(formerly ...)`, or is already closed in COMPLETED.md;
 * a table link's anchor doesn't match its entry heading;
 * an entry has no `**Status:**` line, its status glyph disagrees with the table, or it is marked ✅ in BACKLOG.md;
-* COMPLETED.md has a `## N.` number that doesn't follow the one before it, a missing `(TN.x)` ID,
+* COMPLETED.md has a `## N.` number that doesn't follow the one before it, a missing `(BN.x)` ID,
   or a missing/broken `§N` index link;
 * a link to `spikes/...` points to a missing file.
 
@@ -29,25 +29,25 @@ import os
 import re
 import sys
 
-TASK_ID_RE = re.compile(r"\bT(\d+)\.(\d+)[a-z]?\b")
-TASK_ID_CI_RE = re.compile(r"\bT(\d+)\.(\d+)([a-z])?\b", re.IGNORECASE)
-ENTRY_HEADING = re.compile(r"^### (T(\d+)\.\d+[a-z]?)\.\s+(.*)$")
+TASK_ID_RE = re.compile(r"\bB(\d+)\.(\d+)[a-z]?\b")
+TASK_ID_CI_RE = re.compile(r"\bB(\d+)\.(\d+)([a-z])?\b", re.IGNORECASE)
+ENTRY_HEADING = re.compile(r"^### (B(\d+)\.\d+[a-z]?)\.\s+(.*)$")
 TIER_HEADING = re.compile(r"^## Tier (\d+)\b")
 TABLE_ROW = re.compile(
-    r"^\|\s*\*\*(T\d+\.\d+[a-z]?)\*\*\s*\|\s*\[(?:(?!\]\(#)[^|])+\]\(#([^)|]+)\)\s*\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)\|\s*$"
+    r"^\|\s*\*\*(B\d+\.\d+[a-z]?)\*\*\s*\|\s*\[(?:(?!\]\(#)[^|])+\]\(#([^)|]+)\)\s*\|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)\|\s*$"
 )
 TABLE_SEPARATOR = re.compile(r"^\|[\s:\-|]+\|?\s*$")
 STATUS_LINE_RE = re.compile(r"^\s*(?:[*+-]\s+)?\*\*Status:\*\*\s*(.*)$")
 COMPLETED_HEADING = re.compile(r"^## (\d+)\.\s+(.*)$")
 COMPLETED_INDEX_LINK = re.compile(r"\[§(\d+)\]\(#([^)]+)\)")
 FORMERLY_CLAUSE_RE = re.compile(
-    r"(?<!`)\bformerly\s+`?(T\d+\.\d+[a-z]?)\b`?(?:\s*(?:,\s*(?:(?:and|or)\b\s*)?|/|\b(?:and|or)\b\s*)\s*`?(T\d+\.\d+[a-z]?)\b`?)*",
+    r"(?<!`)\bformerly\s+`?(B\d+\.\d+[a-z]?)\b`?(?:\s*(?:,\s*(?:(?:and|or)\b\s*)?|/|\b(?:and|or)\b\s*)\s*`?(B\d+\.\d+[a-z]?)\b`?)*",
     re.IGNORECASE,
 )
 SPIKE_LINK_RE = re.compile(r"\]\((?:\./)?(spikes/[^)#\s]+)")
 FENCE_RE = re.compile(r"^(`{3,})(?!.*`)|^(~{3,})")
 INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)")
-CODE_TASK_ID_RE = re.compile(r"^`+\s*T\d+\.\d+[a-z]?\s*`+$", re.IGNORECASE)
+CODE_TASK_ID_RE = re.compile(r"^`+\s*B\d+\.\d+[a-z]?\s*`+$", re.IGNORECASE)
 LEGACY_MARKER_RE = re.compile(r"<!--\s*backlog-check:\s*legacy-through=(\d+)\s*-->")
 
 STATUS_GLYPHS = ("📋", "🚧", "💡", "⏸️", "✅")
@@ -87,7 +87,7 @@ def extract_formerly_ids(line):
     for clause in FORMERLY_CLAUSE_RE.finditer(cleaned):
         for m in TASK_ID_CI_RE.finditer(clause.group(0)):
             suffix = (m.group(3) or "").lower()
-            ids.append(f"T{m.group(1)}.{m.group(2)}{suffix}")
+            ids.append(f"B{m.group(1)}.{m.group(2)}{suffix}")
     return ids
 
 
@@ -236,7 +236,7 @@ def parse_backlog(text):
             continue
 
         if line.startswith("## "):
-            if re.match(r"^##\s+T\d+", line):
+            if re.match(r"^##\s+B\d+", line):
                 malformed_headings.append((lineno, line.strip()))
                 current = None
                 continue
@@ -250,7 +250,7 @@ def parse_backlog(text):
             if (
                 line.startswith("### ")
                 and (tier is not None or section == "Active Engineering Backlog")
-            ) or re.match(r"^#{3,}\s+T\d+", line):
+            ) or re.match(r"^#{3,}\s+B\d+", line):
                 malformed_headings.append((lineno, line.strip()))
                 current = None
                 continue
@@ -324,7 +324,7 @@ def parse_completed(text):
             continue
 
         if re.match(r"^#{3,}\s+", line):
-            if in_index or re.match(r"^#{3,}\s+(?:§?\d+\.|T\d+)", line):
+            if in_index or re.match(r"^#{3,}\s+(?:§?\d+\.|B\d+)", line):
                 in_index = False
                 current_ms = None
                 malformed_headings.append((lineno, line.strip()))
@@ -366,7 +366,7 @@ def next_available_summary(entries, completed_milestones, formerly_ids, tiers=(0
             if tier in max_per_tier and num > max_per_tier[tier]:
                 max_per_tier[tier] = num
 
-    next_ids = [f"T{t}.{max_per_tier[t] + 1}" for t in tiers]
+    next_ids = [f"B{t}.{max_per_tier[t] + 1}" for t in tiers]
     next_sec = max((ms["num"] for ms in completed_milestones), default=0) + 1
     return next_ids, next_sec
 
@@ -413,19 +413,19 @@ def check(backlog_dir, max_lines):
     for lineno, raw in malformed_rows:
         problems.append(
             f"BACKLOG.md (line {lineno}): malformed summary-table row `{raw}` "
-            "(expected `| **TN.x** | [Title](#anchor) | Focus | Status | Model | Surface |`)"
+            "(expected `| **BN.x** | [Title](#anchor) | Focus | Status | Model | Surface |`)"
         )
 
     for lineno, raw in malformed_headings:
         problems.append(
             f"BACKLOG.md (line {lineno}): malformed entry heading `{raw}` "
-            "(expected `### TN.x. Title`)"
+            "(expected `### BN.x. Title`)"
         )
 
     for lineno, raw in completed_malformed_headings:
         problems.append(
             f"COMPLETED.md (line {lineno}): malformed milestone heading `{raw}` "
-            "(expected `## N. Title (TN.x)`)"
+            "(expected `## N. Title (BN.x)`)"
         )
 
     row_ids = [r["id"] for r in rows]
@@ -635,7 +635,7 @@ def check(backlog_dir, max_lines):
         if legacy:
             continue
         if not ms["ids"]:
-            problems.append(f"{where}: heading has no `(TN.x)` backlog ID at the end")
+            problems.append(f"{where}: heading has no `(BN.x)` backlog ID at the end")
         if ms["num"] not in index_links:
             problems.append(
                 f"{where}: has no `[§{ms['num']}](#{ms['slug']})` line in `## Index of Delivered Milestones`"

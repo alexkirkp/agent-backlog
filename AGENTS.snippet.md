@@ -7,9 +7,9 @@ edit the same checkout at once; drop them otherwise.
 
 ## Development Backlog
 
-* **Where it lives:** the active backlog and todo list is `BACKLOG.md`; delivered work is
+* **Where it lives:** the active backlog is `BACKLOG.md`; delivered work is
   recorded in `COMPLETED.md`, and long design notes in `spikes/`. Consult the
-  backlog directly for todos and roadmap tasks without searching for it.
+  backlog directly for tasks and roadmap items without searching for it.
 * **Read only what you need.** Read the summary table and the one entry you're working on, not
   the whole file. `COMPLETED.md` grows without bound; search it by ID instead of reading it.
 * **Work top-down.** The summary table is the work queue: when asked for "the next task", take
@@ -23,7 +23,7 @@ edit the same checkout at once; drop them otherwise.
   up front, single-session scope, body under the line cap, row placed by priority and
   dependency, not appended at the bottom.
 * **Check before you finish (and to get the next free IDs):** `python tools/check_backlog.py`
-  prints the next available `TN.x` ID per tier and the next `§N` milestone number (so you don't
+  prints the next available `BN.x` ID per tier and the next `§N` milestone number (so you don't
   need to scan `COMPLETED.md` to allocate an ID), and must pass after any backlog edit.
 * **Shared working tree:** other agents and people may edit the backlog at the same time. A row
   that appeared or flipped status mid-session is a teammate's work, not corruption. Make small,

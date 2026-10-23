@@ -16,7 +16,7 @@ same change.
 <!--
 Index line template (append to the bottom of this section):
 
-* **Short Title of What Shipped ([§1](#1-short-title-of-what-shipped-t01)):** one-line summary.
+* **Short Title of What Shipped ([§1](#1-short-title-of-what-shipped-b01)):** one-line summary.
 -->
 
 ---
@@ -25,7 +25,7 @@ Index line template (append to the bottom of this section):
 Entry template (append below the last milestone entry at the bottom of the file, then add a line
 to the index above):
 
-## 1. Short Title of What Shipped (T0.1)
+## 1. Short Title of What Shipped (B0.1)
 
 * **Status:** ✅ **Completed (YYYY-MM-DD)** · **Priority:** Tier 0 / Focus Area
 * **Model Fit:** <tier or model that did the work>
@@ -37,16 +37,16 @@ to the index above):
 Umbrella closure, added when the last lettered chunk of a parent ID lands (each chunk already
 has its own entry):
 
-## 7. Shared HTTP Client — Umbrella Closure (T1.1)
+## 7. Shared HTTP Client — Umbrella Closure (B1.1)
 
-* **Status:** ✅ **Completed (YYYY-MM-DD)** · all chunks (T1.1a–T1.1b) delivered.
+* **Status:** ✅ **Completed (YYYY-MM-DD)** · all chunks (B1.1a–B1.1b) delivered.
 * **Why it mattered:** the problem the whole set solved, in a sentence or two.
 * **Chunk → write-up map:**
 
   | Chunk | Title | Write-up |
   |:---:|---|:---:|
-  | T1.1a | Give the Shared HTTP Client Timeouts and Retries | [§5](#5-...) |
-  | T1.1b | Route Every Outbound HTTP Call Through the Shared Client | [§6](#6-...) |
+  | B1.1a | Give the Shared HTTP Client Timeouts and Retries | [§5](#5-...) |
+  | B1.1b | Route Every Outbound HTTP Call Through the Shared Client | [§6](#6-...) |
 
 * **Leftovers:** anything the chunks didn't finish, carried into a new backlog ID.
 -->
