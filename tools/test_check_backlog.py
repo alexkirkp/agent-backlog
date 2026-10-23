@@ -470,6 +470,88 @@ class CheckBacklogTests(unittest.TestCase):
         problems, _, _ = self.run_check(backlog)
         self.assertEqual(problems, [])
 
+    def test_repeated_number_is_reported_once_not_cascaded(self):
+        completed = """\
+# Completed
+
+## Index of Delivered Milestones
+
+* **A ([§1](#1-a-t11)):** a.
+* **B ([§2](#2-b-t03)):** b.
+* **C ([§2](#2-c-t04)):** c.
+* **D ([§3](#3-d-t05)):** d.
+
+## 1. A (T1.1)
+
+## 2. B (T0.3)
+
+## 2. C (T0.4)
+
+## 3. D (T0.5)
+"""
+        problems, _, (_, next_sec) = self.run_check(VALID_BACKLOG, completed_text=completed)
+        sequence = [p for p in problems if "expected milestone number" in p]
+        self.assertEqual(len(sequence), 1, problems)  # the repeat; the 3 after it follows the second 2
+        self.assertEqual(next_sec, 4)
+
+    def test_legacy_marker_grandfathers_old_milestones_only(self):
+        completed = """\
+# Completed
+
+<!-- backlog-check: legacy-through=3 -->
+
+## Index of Delivered Milestones
+
+* **D ([§4](#4-d-t07)):** d.
+
+## 1. Pre-ID Milestone
+
+## 3. Skipped a Number (T0.5)
+
+## 3. Repeated a Number (T0.5)
+
+## 4. D (T0.7)
+
+## 4. Collides After the Cutoff (T0.8)
+"""
+        problems, _, (next_ids, next_sec) = self.run_check(VALID_BACKLOG, completed_text=completed)
+        self.assertEqual(len(problems), 2, problems)
+        self.assertTrue(any("§4" in p and "expected milestone number §5" in p for p in problems), problems)
+        self.assertTrue(any("index for §4" in p for p in problems), problems)
+        # grandfathered milestones still retire their IDs
+        self.assertEqual(next_ids[0], "T0.9")
+        self.assertEqual(next_sec, 5)
+
+    def test_legacy_milestone_still_closes_its_id_for_the_backlog(self):
+        completed = """\
+# Completed
+
+<!-- backlog-check: legacy-through=1 -->
+
+## Index of Delivered Milestones
+
+## 1. Old Work (T0.1)
+"""
+        problems, _, _ = self.run_check(VALID_BACKLOG, completed_text=completed)
+        self.assertTrue(any("T0.1 (line" in p and "already closed" in p for p in problems), problems)
+
+    def test_new_milestone_reclosing_a_legacy_id_is_flagged(self):
+        completed = """\
+# Completed
+
+<!-- backlog-check: legacy-through=1 -->
+
+## Index of Delivered Milestones
+
+* **Again ([§2](#2-again-t15)):** again.
+
+## 1. Old Work (T1.5)
+
+## 2. Again (T1.5)
+"""
+        problems, _, _ = self.run_check(VALID_BACKLOG, completed_text=completed)
+        self.assertTrue(any("T1.5 is closed in both §1 and §2" in p for p in problems), problems)
+
 
 if __name__ == "__main__":
     unittest.main()

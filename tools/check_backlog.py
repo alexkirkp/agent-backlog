@@ -11,8 +11,14 @@ checks them. This script fails (exit 1) when:
 * an ID appears twice, was retired via `(formerly ...)`, or is already closed in COMPLETED.md;
 * a table link's anchor doesn't match its entry heading;
 * an entry has no `**Status:**` line, its status glyph disagrees with the table, or it is marked ✅ in BACKLOG.md;
-* COMPLETED.md has non-sequential `## N.` numbers, missing `(TN.x)` IDs, or missing/broken `§N` index links;
+* COMPLETED.md has a `## N.` number that doesn't follow the one before it, a missing `(TN.x)` ID,
+  or a missing/broken `§N` index link;
 * a link to `spikes/...` points to a missing file.
+
+Adopting this in a repo with an existing ledger: a `<!-- backlog-check: legacy-through=N -->`
+marker in COMPLETED.md exempts milestones §N and earlier from the ledger rules (numbering,
+heading ID, index line, double closure), since renumbering them would break every reference to
+them. Their IDs still count as closed.
 
 Usage: python tools/check_backlog.py [DIR] [--max-lines N]
 Standard library only, Python 3.8+.
@@ -42,6 +48,7 @@ SPIKE_LINK_RE = re.compile(r"\]\((?:\./)?(spikes/[^)#\s]+)")
 FENCE_RE = re.compile(r"^(`{3,})(?!.*`)|^(~{3,})")
 INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)")
 CODE_TASK_ID_RE = re.compile(r"^`+\s*T\d+\.\d+[a-z]?\s*`+$", re.IGNORECASE)
+LEGACY_MARKER_RE = re.compile(r"<!--\s*backlog-check:\s*legacy-through=(\d+)\s*-->")
 
 STATUS_GLYPHS = ("📋", "🚧", "💡", "⏸️", "✅")
 
@@ -382,17 +389,24 @@ def check(backlog_dir, max_lines):
     duplicate_index_nums = []
     completed_formerly = []
     completed_spikes = []
+    legacy_through = 0
     completed_path = os.path.join(backlog_dir, "COMPLETED.md")
     if os.path.exists(completed_path):
         with open(completed_path, encoding="utf-8") as f:
-            (
-                completed_milestones,
-                completed_malformed_headings,
-                index_links,
-                duplicate_index_nums,
-                completed_formerly,
-                completed_spikes,
-            ) = parse_completed(f.read())
+            completed_text = f.read()
+        legacy_match = LEGACY_MARKER_RE.search(completed_text)
+        legacy_through = int(legacy_match.group(1)) if legacy_match else 0
+        (
+            completed_milestones,
+            completed_malformed_headings,
+            index_links,
+            duplicate_index_nums,
+            completed_formerly,
+            completed_spikes,
+        ) = parse_completed(completed_text)
+
+    def is_legacy(num):
+        return num is not None and num <= legacy_through
 
     problems = []
 
@@ -476,7 +490,9 @@ def check(backlog_dir, max_lines):
                 for src, origin in retired_sources.get(cid, ())
                 if origin != f"§{ms['num']}"
             ]
-            if cid in completed_ids:
+            if is_legacy(ms["num"]) and (cid not in completed_ids or is_legacy(completed_ids[cid])):
+                pass  # grandfathered: legacy milestones may re-close each other's IDs
+            elif cid in completed_ids:
                 problems.append(
                     f"COMPLETED.md (line {ms['line']}): ID {cid} is closed in both §{completed_ids[cid]} and §{ms['num']}"
                 )
@@ -600,14 +616,24 @@ def check(backlog_dir, max_lines):
             )
 
     for dup_num in sorted(set(duplicate_index_nums)):
-        problems.append(f"COMPLETED.md: duplicate index entry for §{dup_num}")
+        if not is_legacy(dup_num):
+            problems.append(f"COMPLETED.md: duplicate index entry for §{dup_num}")
 
-    for idx, ms in enumerate(completed_milestones, 1):
+    prev_num = 0
+    prev_legacy = True
+    for ms in completed_milestones:
         where = f"COMPLETED.md §{ms['num']} (line {ms['line']})"
-        if ms["num"] != idx:
+        legacy = is_legacy(ms["num"]) and prev_legacy
+        # Each number follows the one before it, so one collision is reported once instead of
+        # shifting every later milestone.
+        if not legacy and ms["num"] != prev_num + 1:
             problems.append(
-                f"{where}: expected milestone number §{idx} (entries are numbered sequentially 1, 2, …)"
+                f"{where}: expected milestone number §{prev_num + 1} (entries are numbered "
+                f"sequentially; a repeat usually means two sessions took the same next §)"
             )
+        prev_num, prev_legacy = ms["num"], legacy
+        if legacy:
+            continue
         if not ms["ids"]:
             problems.append(f"{where}: heading has no `(TN.x)` backlog ID at the end")
         if ms["num"] not in index_links:
@@ -624,7 +650,7 @@ def check(backlog_dir, max_lines):
 
     milestone_nums = {ms["num"] for ms in completed_milestones}
     for num, (_, idx_line) in sorted(index_links.items()):
-        if num not in milestone_nums:
+        if num not in milestone_nums and not is_legacy(num):
             problems.append(
                 f"COMPLETED.md (line {idx_line}): index references §{num} but no `## {num}.` entry exists"
             )
