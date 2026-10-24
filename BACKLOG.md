@@ -80,7 +80,7 @@ not change until something is proven), **Depends on**, **Open questions**.
 | 📋 | Planned | Scoped and ready to pick up. |
 | 🚧 | In Progress | Someone (human or agent) is working on it now. |
 | 💡 | Conceptual | An idea that needs a spike before it can be scoped. |
-| ⏸️ | Gated (Ask First) | Blocked on a decision or approval; don't start without asking. |
+| ⏸️ | Gated | Waiting on something outside the task (a decision, an approval, a human action, another entry, a resource); the status line says what, e.g. `⏸️ **Gated** (waiting on the API v2 release)`. |
 | ✅ | Completed | Used only in `COMPLETED.md`. |
 
 ---

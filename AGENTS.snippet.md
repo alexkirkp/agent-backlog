@@ -13,7 +13,8 @@ edit the same checkout at once; drop them otherwise.
 * **Read only what you need.** Read the summary table and the one entry you're working on, not
   the whole file. `COMPLETED.md` grows without bound; search it by ID instead of reading it.
 * **Work top-down.** The summary table is the work queue: when asked for "the next task", take
-  the top row whose status is 📋 Planned. Don't start a ⏸️ Gated item without asking.
+  the top row whose status is 📋 Planned. A ⏸️ Gated row's status line names what it's waiting
+  on; pass over it until that's resolved.
 * **Keep `BACKLOG.md` current.** When a task you're working on finishes (a backlog item,
   a bug fix, a milestone), update the backlog in the same session: write the entry into
   `COMPLETED.md` (next § number, plus an index line) and remove it from `BACKLOG.md`. Flip a row to
