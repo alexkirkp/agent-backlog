@@ -49,6 +49,9 @@ desktop.ini
 *.swo
 *~
 
+# Batch runner logs
+.backlog_batch/
+
 # Secrets & Local environment
 .env
 .env.*

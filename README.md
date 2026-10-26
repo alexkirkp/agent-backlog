@@ -67,4 +67,16 @@ Each task has a **session-sized entry** focused on *why* it matters and *what "d
    backlog OK: 3 entries (next IDs: B0.2, B1.2, B2.1, B3.1; next completed: §1)
    ```
 
+### Working the queue unattended (optional)
+
+`tools/batch_backlog.py` runs the `📋 Planned` rows one at a time, top to bottom, each in a fresh headless `claude -p` session, so nothing piles up in one long chat. Each session finishes its task (tests green, moved to `COMPLETED.md`, committed) or, when it needs a human, flips the row to `⏸️ Gated` with **Open questions** and stops. Rows whose Model Fit names a human, whose `Depends on:` isn't done, or whose target files have uncommitted edits are skipped.
+
+```sh
+python tools/batch_backlog.py --dry-run                      # preview the queue and the prompt
+python tools/batch_backlog.py --limit 3 --tier-model workhorse=sonnet --tier-model frontier=opus
+python tools/batch_backlog.py --status --wait                # monitor; blocks until the running item changes
+```
+
+Run logs land in `.backlog_batch/` (gitignored). Needs the `claude` CLI on PATH; the script itself is stdlib-only. Tiers route to models via `--tier-model` or a routing-guide line like `* **Workhorse** (Claude Sonnet 5): ...`; `--model` overrides both.
+
 `tools/check_backlog.py` exits `1` on table-to-body drift, entries over 45 non-blank lines, broken anchors or `spikes/` links, duplicate/retired IDs, or out-of-order `§N` milestones in `COMPLETED.md`. (Adopting on an existing ledger? Add `<!-- backlog-check: legacy-through=N -->` to `COMPLETED.md` to exempt milestones `§N` and earlier.)

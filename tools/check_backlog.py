@@ -200,6 +200,7 @@ def parse_backlog(text):
                         "anchor": row.group(2),
                         "status": extract_status_glyph(row.group(4)),
                         "status_raw": row.group(4).strip(),
+                        "model_fit": row.group(5).strip().strip("*").strip(),
                         "line": lineno,
                     }
                 )

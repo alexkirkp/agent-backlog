@@ -26,5 +26,7 @@ jobs:
           python-version: "3.12"
       - name: Check backlog conventions
         run: python tools/check_backlog.py
-      - name: Run checker unit tests
-        run: python -m unittest discover -s tools
+      - name: Run tool unit tests
+        run: |
+          python -m pip install pytest
+          python -m pytest tools -q
