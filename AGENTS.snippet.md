@@ -27,7 +27,9 @@ edit the same checkout at once; drop them otherwise.
   prints the next available `BN.x` ID per tier and the next `§N` milestone number (so you don't
   need to scan `COMPLETED.md` to allocate an ID), and must pass after any backlog edit.
 * **Unattended runs:** `python tools/batch_backlog.py` works the 📋 rows one per fresh `claude -p` session
-  (`--dry-run` previews, `--status --wait` monitors). Don't hand-roll a loop for this.
+  (`--dry-run` previews, `--status --wait` monitors). Pass batch-specific guidance with
+  `--instructions "..."` or `--instructions-file PATH`; it's appended to every item's prompt.
+  Don't hand-roll a loop for this.
 * **Shared working tree:** other agents and people may edit the backlog at the same time. A row
   that appeared or flipped status mid-session is a teammate's work, not corruption. Make small,
   targeted edits; if an edit fails because the text moved, re-read the file and apply your

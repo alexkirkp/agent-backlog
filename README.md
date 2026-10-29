@@ -69,11 +69,13 @@ Each task has a **session-sized entry** focused on *why* it matters and *what "d
 
 ### Working the queue unattended (optional)
 
-`tools/batch_backlog.py` runs the `📋 Planned` rows one at a time, top to bottom, each in a fresh headless `claude -p` session, so nothing piles up in one long chat. Each session finishes its task (tests green, moved to `COMPLETED.md`, committed) or, when it needs a human, flips the row to `⏸️ Gated` with **Open questions** and stops. Rows whose Model Fit names a human, whose `Depends on:` isn't done, or whose target files have uncommitted edits are skipped.
+`tools/batch_backlog.py` runs the `📋 Planned` rows one at a time, top to bottom, each in a fresh headless `claude -p` session, so nothing piles up in one long chat. Each session works its task as far as it can, choosing sensible defaults instead of stopping to ask. A finished task is tested, moved to `COMPLETED.md` and committed. When pieces genuinely need a human, the session commits what it finished, flips the row to `⏸️ Gated` and lists what's left as **Open questions**. Rows whose Model Fit names a human, whose `Depends on:` isn't done, or whose target files have uncommitted edits are skipped.
 
 ```sh
 python tools/batch_backlog.py --dry-run                      # preview the queue and the prompt
 python tools/batch_backlog.py --limit 3 --tier-model workhorse=sonnet --tier-model frontier=opus
+python tools/batch_backlog.py --instructions "Don't touch the public API."   # append to every item's prompt
+python tools/batch_backlog.py --instructions-file batch_notes.md           # same, for multi-line notes
 python tools/batch_backlog.py --status --wait                # monitor; blocks until the running item changes
 ```
 

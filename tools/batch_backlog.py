@@ -6,8 +6,9 @@ nothing piles up in one long chat. Items run one at a time, top to bottom in the
 because they share the working tree. BACKLOG.md is re-read before each pick, so a row that an
 earlier item finished, blocked or reordered is seen as it is now.
 
-Every session gets the same brief: finish the item (tests green, moved to COMPLETED.md,
-committed), or, when it needs a human, flip it to ⏸️ with **Open questions** and stop. The
+Every session gets the same brief: work the item as far as it can (tests green, moved to
+COMPLETED.md, committed), and when pieces need a human, commit what's done, flip the row to ⏸️ and
+list what's left as **Open questions**. The
 reply ends in a `BATCH_RESULT:` line, which goes into a markdown run log under
 `.backlog_batch/` with the commits, cost and session id (`claude --resume <id>` reopens
 a session). The raw JSON of each session sits next to the log.
@@ -37,7 +38,7 @@ whoever reads it.
 
 Usage: python tools/batch_backlog.py [--dry-run] [--limit N] [--only B1.1,B1.2]
        [--model M] [--tier-model workhorse=sonnet] [--permission-mode auto] [--max-budget-usd X]
-       [--timeout-min N]
+       [--timeout-min N] [--instructions TEXT] [--instructions-file PATH]
        python tools/batch_backlog.py --status [STAMP] [--wait]
 
 Standard library only, Python 3.8+ (plus the `claude` CLI on PATH). Run it from the repo root.
@@ -74,7 +75,7 @@ MODEL_FAMILIES = ("fable", "opus", "sonnet", "haiku")
 GUIDE_TIER = re.compile(r"^\* \*\*([A-Za-z]+)\*\* \(([^)]*)\)")
 DENIAL_RE = re.compile(r"permission|denied|not allowed", re.IGNORECASE)
 RESULT_PREFIX = "BATCH_RESULT:"
-RESULTS = ("done", "blocked", "failed")
+RESULTS = ("done", "partial", "blocked", "failed")
 RECENT_CALLS = 20
 TASK_ID = re.compile(r"\bB\d+\.\d+[a-z]?\b")
 TARGET_FILE = re.compile(r"`([^`\s]+\.[A-Za-z0-9]+)`")
@@ -104,28 +105,35 @@ def parse_utc(value):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-PROMPT = """You are running unattended in a backlog batch: nobody can answer questions until the \
-batch ends. Work only on {task_id} in BACKLOG.md. Read its summary-table row, its entry and any \
-spike it links, and follow the project's agent instructions (AGENTS.md, CLAUDE.md or similar).
+PROMPT = """Let's do {task_id} from BACKLOG.md. Its summary-table row, entry and any linked spike \
+were written for an agent like you to carry out: read them, follow the project's agent \
+instructions (AGENTS.md, CLAUDE.md or similar) and do the work.
 
-1. First decide whether you can finish it this session without a human. It is blocked if it \
-needs a decision only a person can make, a write to a live account or production system, \
-credentials, hardware or another machine, or it is bigger than one session. If it is blocked, \
-write no code: flip its row and Status line to ⏸️ Gated, naming what it waits on, and add an \
-**Open questions** field with each question, what you would do by default, and what it blocks. \
-Long notes go in a spike under spikes/, linked from the entry. Run \
-`python tools/check_backlog.py`, commit, and stop.
-2. Otherwise flip it to 🚧 and implement it test-first, then run the project's full test suite.
-3. Green: move it to COMPLETED.md per the backlog conventions, run `python tools/check_backlog.py` \
-and commit with {task_id} in the subject.
-4. Still red after a real attempt: commit nothing that fails. Leave your edits in the tree, flip \
-the row to ⏸️ with **Open questions** saying what fails, what you tried and which files you left \
-uncommitted, and commit BACKLOG.md.
+You are running unattended in a backlog batch, so nobody can answer questions until it ends. \
+Use your judgment instead of stopping to ask: where the entry leaves a choice open, pick the \
+sensible default that fits the codebase, note it in your commit message and keep going. An item \
+that looks large or unfamiliar is not a reason to stop.
+
+Flip the row to 🚧, work through the item as far as you can (test-first where it fits) and run \
+the project's full test suite. Set aside only the pieces you truly cannot do from here: a decision \
+only a person can make and no reasonable default covers, a write to a live account or production \
+system, credentials, or hardware or another machine. Do everything around them.
+
+* All done and green: move it to COMPLETED.md per the backlog conventions, run \
+`python tools/check_backlog.py` and commit with {task_id} in the subject.
+* Pieces left over: commit the finished, green work with {task_id} in the subject. Keep the entry \
+in BACKLOG.md, note what is done, flip its row and Status line to ⏸️ Gated naming what it waits \
+on, and add **Open questions** listing each remaining piece, why you couldn't do it and what you'd \
+do by default. Run `python tools/check_backlog.py` and commit.
+* Tests still red after a real attempt: commit nothing that fails. Leave your edits in the tree, \
+flip the row to ⏸️ with **Open questions** saying what fails, what you tried and which files you \
+left uncommitted, and commit BACKLOG.md.
 
 Write scripts and multi-line files with your file-writing tool, never a shell heredoc: heredocs truncate in transit (emoji, backslashes) and fail with `unexpected EOF`. If a test fails only in files you did not touch, mention it in one line and move on; do not investigate it.
 
 Never switch branches or revert changes you didn't make. End your reply with exactly one line:
-{prefix} done|blocked|failed — <one-line summary>
+{prefix} done|partial|blocked|failed — <one-line summary>
+(partial: some of it committed, the rest left as open questions; blocked: none of it could be done)
 """
 
 
@@ -249,8 +257,21 @@ def model_for(fit, models):
     return ""
 
 
-def build_prompt(task_id):
-    return PROMPT.format(task_id=task_id, prefix=RESULT_PREFIX)
+def build_prompt(task_id, instructions=""):
+    """The brief for one item, with any batch-wide extra instructions appended."""
+    prompt = PROMPT.format(task_id=task_id, prefix=RESULT_PREFIX)
+    if instructions:
+        prompt += f"\nExtra instructions for this batch (they win over the brief above where they conflict):\n{instructions}\n"
+    return prompt
+
+
+def extra_instructions(texts, files):
+    """`--instructions` texts and `--instructions-file` contents, in that order, one block."""
+    parts = [t.strip() for t in texts]
+    for path in files:
+        with open(path, encoding="utf-8") as f:
+            parts.append(f.read().strip())
+    return "\n\n".join(p for p in parts if p)
 
 
 def parse_result(reply):
@@ -362,7 +383,7 @@ def run_item(task_id, model, session_id, args, run_dir):
             text=True,
             encoding="utf-8",
         )
-        proc.stdin.write(build_prompt(task_id))
+        proc.stdin.write(build_prompt(task_id, args.extra))
         proc.stdin.close()
         while True:
             try:
@@ -425,6 +446,9 @@ def log_header(path, stamp, args):
         f.write(f"# Backlog batch {stamp}\n\n")
         f.write(f"Branch `{git('rev-parse', '--abbrev-ref', 'HEAD')}`, permission mode `{args.permission_mode}`")
         f.write(f", model `{args.model}` for every item.\n\n" if args.model else ", models by Model Fit.\n\n")
+        if args.extra:
+            quoted = "".join(f"> {line}".rstrip() + "\n" for line in args.extra.splitlines())
+            f.write(f"Extra instructions:\n\n{quoted}\n")
         f.write("| ID | Model | Result | Min | Cost | Commits | Summary | Session |\n")
         f.write("|---|---|---|---:|---:|---|---|---|\n")
 
@@ -742,6 +766,20 @@ def main(argv=None):
     parser.add_argument(
         "--permission-mode", default="auto", help="claude --permission-mode for every session (default: auto)"
     )
+    parser.add_argument(
+        "--instructions",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="extra instructions appended to every item's prompt (repeatable)",
+    )
+    parser.add_argument(
+        "--instructions-file",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="a file of extra instructions appended to every item's prompt (repeatable; for multi-line text)",
+    )
     parser.add_argument("--max-budget-usd", type=float, default=0, help="per-item spend cap (default: none)")
     parser.add_argument("--timeout-min", type=int, default=120, help="per-item wall clock cap (default: 120)")
     parser.add_argument(
@@ -754,6 +792,10 @@ def main(argv=None):
     parser.add_argument("--backlog", default=DEFAULT_BACKLOG, help="the backlog file (default: BACKLOG.md at the repo root)")
     parser.add_argument("--claude", default=shutil.which("claude") or "claude", help="the claude executable")
     args = parser.parse_args(argv)
+    try:
+        args.extra = extra_instructions(args.instructions, args.instructions_file)
+    except OSError as e:
+        parser.error(f"--instructions-file: {e}")
 
     if args.status is not None:
         run_dir = latest_run_dir(args.status or None)
@@ -787,7 +829,7 @@ def main(argv=None):
             note = f"SKIPPED: {reason}" if reason else f"→ {pick_model(row, models) or 'default'}"
             print(f"  {row['id']:<9} {row['model_fit']:<20} {note}")
         print("\nPrompt for each item:\n")
-        print(build_prompt("<ID>"))
+        print(build_prompt("<ID>", args.extra))
         return 0
 
     stamp = now_local().strftime("%Y%m%d-%H%M")
@@ -805,6 +847,7 @@ def main(argv=None):
         "tier_models": args.tier_model,
         "only": sorted(only),
         "include_human": args.include_human,
+        "instructions": args.extra,
         "current": None,
         "finished": [],
         "ended": None,

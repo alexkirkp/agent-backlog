@@ -67,11 +67,12 @@ def test_model_for(fit, expected):
         ("work\nBATCH_RESULT: done — added the thing", ("done", "added the thing")),
         ("BATCH_RESULT: blocked - needs a hub decision\n", ("blocked", "needs a hub decision")),
         ("`BATCH_RESULT: failed — tests red`", ("failed", "tests red")),
+        ("BATCH_RESULT: partial — 3 of 4 done", ("partial", "3 of 4 done")),
         ("BATCH_RESULT: done|blocked|failed — x\nBATCH_RESULT: done — real", ("done", "real")),
         ("no marker at all", ("unknown", "")),
         ("BATCH_RESULT: maybe — hmm", ("unknown", "maybe — hmm")),
     ],
-    ids=["done", "blocked-hyphen", "backticked", "last-line-wins", "missing", "bad-word"],
+    ids=["done", "blocked-hyphen", "backticked", "partial", "last-line-wins", "missing", "bad-word"],
 )
 def test_parse_result(reply, expected):
     assert batch_backlog.parse_result(reply) == expected
@@ -190,6 +191,23 @@ def test_each_session_gets_its_own_id_and_the_state_records_it(tmp_path):
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert [r["id"] for r in state["finished"]] == ["B2.101", "B3.8"]
     assert state["current"] is None and state["ended"] and state["stop_reason"] == ""
+
+
+def test_extra_instructions_reach_every_prompt_the_log_and_the_state(tmp_path):
+    notes = tmp_path / "notes.md"
+    notes.write_text("Use the staging config.\nSkip the docs site.\n", encoding="utf-8")
+    sessions = [fake_session("BATCH_RESULT: done — one"), fake_session("BATCH_RESULT: done — two")]
+    _, log = run_main(tmp_path, sessions, "--instructions", "Prefer pathlib.", "--instructions-file", str(notes))
+    for session in sessions:
+        assert session.prompt.rstrip().endswith("Prefer pathlib.\n\nUse the staging config.\nSkip the docs site.")
+    assert "> Prefer pathlib.\n>\n> Use the staging config." in log
+    (state_path,) = (tmp_path / "logs").glob("*/state.json")
+    assert "Skip the docs site." in json.loads(state_path.read_text(encoding="utf-8"))["instructions"]
+
+
+def test_no_extra_instructions_leaves_the_brief_alone():
+    assert batch_backlog.build_prompt("B2.1", "") == batch_backlog.build_prompt("B2.1")
+    assert "Extra instructions" not in batch_backlog.build_prompt("B2.1")
 
 
 def test_model_flag_overrides_every_item(tmp_path):
