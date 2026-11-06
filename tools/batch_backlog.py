@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Work BACKLOG.md's 📋 Planned rows unattended, one fresh headless agent session each.
 
-Each item runs as its own `claude -p` (Claude Code) or `agy -p` (Antigravity) session, so no context
-carries over between items and nothing piles up in one long chat. `--agent` picks the CLI; without
-it, `$BACKLOG_AGENT`, else `claude` when it is on PATH, else `agy`. Items run one at a time, top to bottom in the summary table,
+Each item runs as its own `claude -p` (Claude Code), `agy -p` (Antigravity) or `agent -p` (Cursor)
+session, so no context carries over between items and nothing piles up in one long chat. `--agent`
+picks the CLI; without it, `$BACKLOG_AGENT`, else the first of claude, agy, cursor on PATH. Items run one at a time, top to bottom in the summary table,
 because they share the working tree. BACKLOG.md is re-read before each pick, so a row that an
 earlier item finished, blocked or reordered is seen as it is now.
 
@@ -12,7 +12,7 @@ COMPLETED.md, committed), and when pieces need a human, commit what's done, flip
 list what's left as **Open questions**. The
 reply ends in a `BATCH_RESULT:` line, which goes into a markdown run log under
 `.backlog_batch/` with the commits, cost and session id (`claude --resume <id>` or
-`agy --conversation <id>` reopens a session). The raw JSON of each session sits next to the log.
+`agy --conversation <id>` or `agent --resume <id>` reopens a session). The raw JSON of each session sits next to the log.
 
 A session that sits quiet for `--idle-min` after its `BATCH_RESULT:` line is ended and that line is
 its result (a background Monitor can keep a finished `claude -p` alive). A session that dies or is
@@ -45,12 +45,19 @@ their own or at `--timeout-min`). agy cannot ask for permission headless: give i
 only, so narrower rules don't cover a batch), or pass `--permission-mode skip`. A session that hits a
 denial is an error and stops the batch.
 
-Usage: python tools/batch_backlog.py [--agent claude|agy] [--dry-run] [--limit N] [--only B1.1,B1.2]
+With `--agent cursor` the routing guide's names resolve against `agent models` (`Claude Opus 5.5` →
+`claude-opus-5-5`; a Claude family with no exact id takes its newest), and `auto` is a valid model: it hands
+each request to Cursor's Auto router. Items run with `--force --trust` (print mode only proposes edits
+without `--force`; deny rules in `~/.cursor/cli-config.json` still hold). The prompt goes in on stdin
+and the output is a `stream-json` event stream saved as `<ID>.jsonl`, which the idle check and
+`--status` read live. Cursor reports tokens, not dollars.
+
+Usage: python tools/batch_backlog.py [--agent claude|agy|cursor] [--dry-run] [--limit N] [--only B1.1,B1.2]
        [--model M] [--tier-model workhorse=sonnet] [--permission-mode auto] [--max-budget-usd X]
        [--timeout-min N] [--instructions TEXT] [--instructions-file PATH]
        python tools/batch_backlog.py --status [STAMP] [--wait]
 
-Standard library only, Python 3.8+ (plus the `claude` or `agy` CLI on PATH). Run it from the repo root.
+Standard library only, Python 3.8+ (plus the `claude`, `agy` or Cursor `agent` CLI on PATH). Run it from the repo root.
 """
 
 import argparse
@@ -80,8 +87,12 @@ DEFAULT_BACKLOG = os.path.join(PROJECT_ROOT, "BACKLOG.md")
 LOG_ROOT = os.path.join(PROJECT_ROOT, ".backlog_batch")
 MAX_LINES = 45  # check_backlog's entry cap, for the status view's backlog check
 STATE_FILE = "state.json"
-AGENTS = ("claude", "agy")
+AGENTS = ("claude", "agy", "cursor")
+# Executables each agent may be installed as, in the order they are looked for on PATH. Cursor's CLI
+# is `agent` (older installs: `cursor-agent`); `cursor` is the editor's launcher, not the agent.
+BINARIES = {"claude": ("claude",), "agy": ("agy",), "cursor": ("agent", "cursor-agent")}
 AGY_SETTINGS = "~/.gemini/antigravity-cli/settings.json"
+CURSOR_AUTO = "auto"  # the Cursor model id that hands each request to Auto (Cursor Router)
 AGY_EFFORT = "medium"  # agy model ids carry an effort suffix; a guide name without one gets this
 MODEL_FAMILIES = ("fable", "opus", "sonnet", "haiku")
 GUIDE_TIER = re.compile(r"^\* \*\*([A-Za-z]+)\*\* \(([^)]*)\)")
@@ -287,6 +298,67 @@ def agy_model_ids(cli):
     return ids
 
 
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+CURSOR_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9.\-]*$")
+
+
+def cursor_model_ids(cli):
+    """The model ids `agent models` lists (the first word of each line that is an id), or [] when it can't be run.
+
+    Lines look like `sonnet-5-thinking - Claude Sonnet 5 Thinking`; headers and tips start with a
+    capital or a symbol, so only lowercase id-shaped first words count.
+    """
+    try:
+        proc = subprocess.run(
+            [cli, "models"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("agent models failed: %s", e)
+        return []
+    ids = []
+    for line in ANSI.sub("", proc.stdout).splitlines():
+        words = line.strip().lstrip("*•-> ").split()
+        if words and CURSOR_MODEL_ID.match(words[0]) and re.search("[a-z]", words[0]) and words[0] not in ids:
+            ids.append(words[0])
+    return ids
+
+
+def version_key(model_id):
+    """The numbers in an id as a tuple, so `claude-opus-5-5` sorts above `claude-opus-5` and `claude-opus-4-8`."""
+    return tuple(int(n) for n in re.findall(r"\d+", model_id))
+
+
+def cursor_resolver(model_ids):
+    """A guide-name → Cursor model id function over the ids `agent models` lists.
+
+    Tries the name as an id (`Claude Opus 5.5` → `claude-opus-5-5`, `Auto` → `auto`), then without
+    a leading `Claude` for short-form ids (`Claude Sonnet 4` → `sonnet-4`), preferring an exact id over a variant such as
+    `-thinking`. A Claude family name that still matches nothing takes that family's newest listed id,
+    so a guide naming an older version routes to the current one. None when Cursor offers no match.
+    """
+
+    def norm(s):
+        return re.sub(r"[\s._]+", "-", s.strip().lower())
+
+    def resolve(name):
+        slug = norm(name)
+        if not slug:
+            return None
+        tries = [slug] + ([slug[len("claude-") :]] if slug.startswith("claude-") else [])
+        for attempt in tries:
+            hits = [m for m in model_ids if norm(m) == attempt or norm(m).startswith(attempt + "-")]
+            if hits:
+                return min(hits, key=lambda m: (norm(m) != attempt, len(m)))
+        family = claude_alias(name)
+        if family:
+            same = [m for m in model_ids if family in norm(m).split("-")]
+            if same:
+                return max(same, key=lambda m: (version_key(m), -len(m)))
+        return None
+
+    return resolve
+
+
 def tier_models(text, overrides=(), resolve=claude_alias):
     """Tier → CLI model: the first model each tier lists in the routing guide's brackets that `resolve` maps.
 
@@ -388,6 +460,32 @@ def agy_command(args, model, prompt):
     return cmd + [f"--print={prompt}"]
 
 
+def cursor_command(args, model):
+    """Cursor's `agent -p`, streaming NDJSON events; the prompt goes in on stdin.
+
+    stdin, not argv, because on Windows `agent` is a `.cmd` shim and cmd.exe cuts an argument at its
+    first newline. `--force` applies edits and runs commands (without it print mode only proposes
+    them); deny rules in Cursor's cli-config.json still hold. `--trust` skips the workspace-trust prompt.
+    """
+    cmd = [args.cli, "-p", "--output-format", "stream-json", "--force", "--trust"]
+    if model:
+        cmd += ["--model", model]
+    return cmd
+
+
+def stream_events(text):
+    """The JSON objects in an NDJSON stream; a partial last line (still being written) is skipped."""
+    events = []
+    for line in (text or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
 def claude_outcome(payload, returncode):
     """`(reply, error, session, cost, tokens)` from `claude -p --output-format json`; reply None on failure."""
     if not isinstance(payload, dict):
@@ -422,7 +520,27 @@ def agy_outcome(payload, returncode):
     return None, f"agy status {payload.get('status')}" + ("" if reply.strip() else ", empty response"), session, None, tokens
 
 
-OUTCOMES = {"claude": claude_outcome, "agy": agy_outcome}
+def cursor_outcome(events, returncode):
+    """`(reply, error, session, cost, tokens)` from `agent -p --output-format stream-json`; reply None on failure.
+
+    Success ends in a `result` event; failure emits none and exits non-zero with the reason on stderr.
+    Cursor reports no cost; its result event carries `usage` (camelCase token counts) when the turn reported any.
+    """
+    events = events if isinstance(events, list) else []
+    session = next((e["session_id"] for e in events if e.get("session_id")), None)
+    result = next((e for e in reversed(events) if e.get("type") == "result"), None)
+    if result is None:
+        return None, f"exit {returncode} without a result event", session, None, None
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    kinds = ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens")  # inputTokens excludes cache
+    tokens = sum(usage.get(k) or 0 for k in kinds) or None
+    reply = result.get("result") or ""
+    if returncode == 0 and not result.get("is_error") and reply.strip():
+        return reply, "", session, None, tokens
+    return None, (reply if result.get("is_error") else "") or "empty result", session, None, tokens
+
+
+OUTCOMES = {"claude": claude_outcome, "agy": agy_outcome, "cursor": cursor_outcome}
 
 
 def held_result(transcript, now, idle_min):
@@ -451,6 +569,87 @@ def held_result(transcript, now, idle_min):
     return held
 
 
+def idle_minutes(path, now):
+    """Minutes since the file was last written (a Cursor stream carries no timestamps); None when missing."""
+    try:
+        return (now.timestamp() - os.path.getmtime(path)) / 60
+    except (OSError, TypeError):
+        return None
+
+
+def stream_held_result(path, now, idle_min):
+    """`held_result` for a Cursor event stream: the BATCH_RESULT reply when nothing followed it and it sat quiet."""
+    if not path or not os.path.isfile(path):
+        return None
+    held = None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for event in stream_events(f.read()):
+            if event.get("type") == "assistant":
+                texts = [b.get("text", "") for b in ((event.get("message") or {}).get("content") or []) if isinstance(b, dict)]
+                held = next((t for t in texts if RESULT_PREFIX in t), None)
+            elif event.get("type") in ("tool_call", "user"):
+                held = None
+    idle = idle_minutes(path, now)
+    if held is None or idle is None or idle < idle_min:
+        return None
+    return held
+
+
+def cursor_call(tool_call):
+    """`(name, args, outcome)` of a Cursor tool call: `{"shellToolCall": {"args": {...}, "result": {"success": ...}}}`."""
+    if not isinstance(tool_call, dict) or not tool_call:
+        return "?", {}, ""
+    tool = tool_call.get("tool")
+    if isinstance(tool, dict) and "case" in tool:  # the protobuf object form, should the JSON form change
+        tool_call = {tool["case"]: tool.get("value") or {}}
+    key, body = next(iter(tool_call.items()))
+    body = body if isinstance(body, dict) else {}
+    name = body.get("name") or (key[: -len("ToolCall")] if key.endswith("ToolCall") else key)
+    args = body.get("args")
+    if args is None and isinstance(body.get("arguments"), str):
+        try:
+            args = json.loads(body["arguments"])
+        except json.JSONDecodeError:
+            args = {"arguments": body["arguments"]}
+    result = body.get("result")
+    outcome = next(iter(result), "") if isinstance(result, dict) and result else ""
+    return str(name)[:1].upper() + str(name)[1:], args if isinstance(args, dict) else {}, outcome
+
+
+def stream_digest(path, now):
+    """`transcript_digest` for a Cursor event stream, minus cost (Cursor reports none)."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        events = stream_events(f.read())
+    turns, calls, outcomes, last_text = 0, [], [], ""
+    for event in events:
+        kind = event.get("type")
+        if kind == "assistant":
+            turns += 1
+            for block in (event.get("message") or {}).get("content") or []:
+                if isinstance(block, dict) and block.get("text", "").strip():
+                    last_text = block["text"]
+        elif kind == "tool_call":
+            name, args, outcome = cursor_call(event.get("tool_call"))
+            if event.get("subtype") == "started":
+                calls.append(describe_call(name, args))
+            elif event.get("subtype") == "completed":
+                outcomes.append(outcome)
+    failed = [o for o in outcomes if o and o != "success"]
+    recent = [o for o in outcomes[-RECENT_CALLS:] if o and o != "success"]
+    idle = idle_minutes(path, now)
+    return {
+        "session": next((e["session_id"] for e in events if e.get("session_id")), None),
+        "turns": turns,
+        "calls": len(calls),
+        "idle_min": None if idle is None else round(idle),
+        "last_calls": calls[-6:],
+        "recent_errors": len(recent),
+        "denials": sum(1 for o in failed if DENIAL_RE.search(o) or o == "rejected"),
+        "repeated": [(call, n) for call, n in Counter(calls[-RECENT_CALLS:]).most_common(2) if n >= 3],
+        "last_text": one_line(last_text, 200),
+    }
+
+
 def end_process(proc):
     """End a session and whatever it spawned (on Windows a plain terminate leaves the children)."""
     if os.name == "nt":
@@ -462,6 +661,11 @@ def end_process(proc):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+
+
+def stream_path(run_dir, task_id, agent):
+    """Where an item's CLI output lands: Cursor's NDJSON event stream (read live) or the final JSON."""
+    return os.path.join(run_dir, f"{task_id}.jsonl" if agent == "cursor" else f"{task_id}.json")
 
 
 def run_item(task_id, model, session_id, args, run_dir):
@@ -477,7 +681,7 @@ def run_item(task_id, model, session_id, args, run_dir):
         "cost": None,
         "session": session_id,
     }
-    out_path = os.path.join(run_dir, f"{task_id}.json")
+    out_path = stream_path(run_dir, task_id, args.agent)
     err_path = os.path.join(run_dir, f"{task_id}.stderr.txt")
     deadline = time.monotonic() + args.timeout_min * 60
     idle_reply = None  # the held BATCH_RESULT reply once the session sat quiet and was ended
@@ -485,6 +689,8 @@ def run_item(task_id, model, session_id, args, run_dir):
     prompt = build_prompt(task_id, args.extra)
     if args.agent == "agy":
         cmd, stdin_text = agy_command(args, model, prompt), None
+    elif args.agent == "cursor":
+        cmd, stdin_text = cursor_command(args, model), prompt
     else:
         cmd, stdin_text = claude_command(args, model, session_id), prompt
     with open(out_path, "w", encoding="utf-8") as out, open(err_path, "w", encoding="utf-8") as err:
@@ -506,8 +712,11 @@ def run_item(task_id, model, session_id, args, run_dir):
                 break
             except subprocess.TimeoutExpired:
                 pass
-            transcript = find_transcript(session_id) if args.agent == "claude" else None
-            held = held_result(transcript, now_utc(), args.idle_min)
+            if args.agent == "cursor":
+                held = stream_held_result(out_path, now_utc(), args.idle_min)
+            else:
+                transcript = find_transcript(session_id) if args.agent == "claude" else None
+                held = held_result(transcript, now_utc(), args.idle_min)
             if held:
                 idle_reply = held
                 end_process(proc)
@@ -526,10 +735,13 @@ def run_item(task_id, model, session_id, args, run_dir):
 
     record["commits"] = commits_since(base, task_id)
     record["minutes"] = round((now_utc() - started).total_seconds() / 60)
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError:
-        payload = None
+    if args.agent == "cursor":
+        payload = stream_events(stdout)
+    else:
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            payload = None
     reply, detail, session, cost, tokens = OUTCOMES[args.agent](payload, proc.returncode)
     record["cost"] = cost
     record["session"] = session or session_id
@@ -646,7 +858,9 @@ def one_line(text, width):
 def describe_call(name, args):
     """A tool call as `Name target`: the command, path or pattern that tells calls apart."""
     args = args if isinstance(args, dict) else {}
-    target = args.get("command") or args.get("file_path") or args.get("pattern") or args.get("description")
+    target = (
+        args.get("command") or args.get("file_path") or args.get("path") or args.get("pattern") or args.get("description")
+    )
     if target is None:
         target = next((v for v in args.values() if isinstance(v, str)), "")
     target = str(target).replace(PROJECT_ROOT + os.sep, "").replace(PROJECT_ROOT.replace(os.sep, "/") + "/", "")
@@ -832,7 +1046,24 @@ def render_status(run_dir, backlog_path=DEFAULT_BACKLOG):
         session = current["session"] or "known when it ends"
         lines.append(f"Current: {current['id']} ({current['model']}) {minutes} min, {agent} session {session}")
         transcript = find_transcript(current["session"]) if agent == "claude" else None
-        if agent != "claude":
+        stream = stream_path(run_dir, current["id"], agent) if agent == "cursor" else None
+        if stream:
+            if not os.path.isfile(stream):
+                lines.append("  no event stream yet")
+            else:
+                d = stream_digest(stream, now)
+                if d["session"] and not current["session"]:
+                    lines[-1] = lines[-1].replace("session known when it ends", f"session {d['session']}")
+                idle = "?" if d["idle_min"] is None else f"{d['idle_min']} min"
+                lines.append(f"  {d['turns']} turns, {d['calls']} tool calls, last activity {idle} ago (Cursor reports no cost)")
+                lines += [f"  > {call}" for call in d["last_calls"]]
+                lines.append(f"  Failed tool calls in the last {RECENT_CALLS}: {d['recent_errors']}")
+                lines.append(f"  Rejected or denied so far: {d['denials']}")
+                for call, n in d["repeated"]:
+                    lines.append(f"  Repeated ×{n} in the last {RECENT_CALLS}: {call}")
+                if d["last_text"]:
+                    lines.append(f"  Last said: {d['last_text']}")
+        elif agent != "claude":
             lines.append(f"  {agent} conversations can't be read live: judge it by the tree and commits above")
         elif not transcript:
             lines.append("  no transcript yet")
@@ -859,7 +1090,7 @@ def render_status(run_dir, backlog_path=DEFAULT_BACKLOG):
         attempted = [r["id"] for r in finished] + ([current["id"]] if current else [])
         only = set(state.get("only") or [])
         queue = [r for r in planned_queue(text, attempted, state.get("include_human")) if not only or r["id"].upper() in only]
-        resolve = agy_resolver(state.get("agy_models") or []) if state.get("agent") == "agy" else claude_alias
+        resolve = resolver_for(state.get("agent", "claude"), state.get("agy_models") or state.get("cursor_models") or [])
         models = tier_models(text, state.get("tier_models") or (), resolve)
         left = [f"{r['id']} {state.get('model') or model_for(r['model_fit'], models) or 'default'}" for r in queue]
         lines.append(f"Queue: {len(left)} left" + (f": {', '.join(left)}" if left else ""))
@@ -869,13 +1100,27 @@ def render_status(run_dir, backlog_path=DEFAULT_BACKLOG):
 # --- the batch ----------------------------------------------------------------------------------
 
 
+def find_cli(agent, which=shutil.which):
+    """The agent's executable on PATH (Cursor's may be `agent` or `cursor-agent`); None when it isn't there."""
+    return next((path for path in map(which, BINARIES[agent]) if path), None)
+
+
 def default_agent(env=None, which=shutil.which):
-    """`$BACKLOG_AGENT` when it names a known agent, else `claude` when it's on PATH, else `agy` when that is."""
+    """`$BACKLOG_AGENT` when it names a known agent, else the first of claude, agy, cursor on PATH, else `claude`."""
     env = os.environ if env is None else env
     named = (env.get("BACKLOG_AGENT") or "").strip().lower()
     if named in AGENTS:
         return named
-    return next((a for a in AGENTS if which(a)), "claude")
+    return next((a for a in AGENTS if find_cli(a, which)), "claude")
+
+
+def resolver_for(agent, listed):
+    """How guide model names become this agent's model ids: Claude aliases, or a match in the CLI's own list."""
+    if agent == "agy":
+        return agy_resolver(listed)
+    if agent == "cursor":
+        return cursor_resolver(listed)
+    return claude_alias
 
 
 def main(argv=None):
@@ -888,7 +1133,7 @@ def main(argv=None):
         "--agent",
         choices=AGENTS,
         default=default_agent(),
-        help="the CLI that works each item (default: $BACKLOG_AGENT, else claude if on PATH, else agy)",
+        help="the CLI that works each item (default: $BACKLOG_AGENT, else the first of claude, agy, cursor on PATH)",
     )
     parser.add_argument("--dry-run", action="store_true", help="print the queue and the prompt, run nothing")
     parser.add_argument(
@@ -919,7 +1164,8 @@ def main(argv=None):
         "--permission-mode",
         default=None,
         help="claude: its --permission-mode (default: auto). agy: `settings` (default; the grants in its "
-        "settings.json) or `skip` (--dangerously-skip-permissions)",
+        "settings.json) or `skip` (--dangerously-skip-permissions). cursor: `force` only (--force; the deny "
+        "rules in its cli-config.json still hold)",
     )
     parser.add_argument(
         "--instructions",
@@ -946,20 +1192,24 @@ def main(argv=None):
     parser.add_argument("--poll-sec", type=float, default=15, help="how often a running session is checked")
     parser.add_argument("--backlog", default=DEFAULT_BACKLOG, help="the backlog file (default: BACKLOG.md at the repo root)")
     parser.add_argument(
-        "--cli", "--claude", dest="cli", default=None, help="the agent's executable (default: `claude` or `agy` on PATH)"
+        "--cli", "--claude", dest="cli", default=None, help="the agent's executable (default: `claude`, `agy` or Cursor's `agent` on PATH)"
     )
     args = parser.parse_args(argv)
     try:
         args.extra = extra_instructions(args.instructions, args.instructions_file)
     except OSError as e:
         parser.error(f"--instructions-file: {e}")
-    args.cli = args.cli or shutil.which(args.agent) or args.agent
-    if args.agent == "agy":
+    args.cli = args.cli or find_cli(args.agent) or BINARIES[args.agent][0]
+    if args.agent in ("agy", "cursor") and args.max_budget_usd:
+        parser.error(f"--max-budget-usd is claude-only: {args.agent} has no spend cap")
+    if args.agent == "cursor":
+        args.permission_mode = args.permission_mode or "force"
+        if args.permission_mode != "force":
+            parser.error("--permission-mode for cursor is `force`: without --force its print mode only proposes edits")
+    elif args.agent == "agy":
         args.permission_mode = args.permission_mode or "settings"
         if args.permission_mode not in ("settings", "skip"):
             parser.error("--permission-mode for agy is `settings` or `skip`")
-        if args.max_budget_usd:
-            parser.error("--max-budget-usd is claude-only: agy has no spend cap")
     else:
         args.permission_mode = args.permission_mode or "auto"
 
@@ -971,8 +1221,9 @@ def main(argv=None):
         return 0
 
     only = {i.strip().upper() for i in args.only.split(",") if i.strip()}
-    agy_models = agy_model_ids(args.cli) if args.agent == "agy" and not args.model else []
-    resolve = agy_resolver(agy_models) if args.agent == "agy" else claude_alias
+    lister = {"agy": agy_model_ids, "cursor": cursor_model_ids}.get(args.agent)
+    listed = lister(args.cli) if lister and not args.model else []
+    resolve = resolver_for(args.agent, listed)
 
     def queue(attempted):
         """The rows still to run, the tier → model map and the backlog text, all as the backlog is now."""
@@ -1011,7 +1262,8 @@ def main(argv=None):
         "stamp": stamp,
         "pid": os.getpid(),
         "agent": args.agent,
-        "agy_models": agy_models,
+        "agy_models": listed if args.agent == "agy" else [],
+        "cursor_models": listed if args.agent == "cursor" else [],
         "started": now_utc().isoformat(),
         "base": git("rev-parse", "HEAD"),
         "log": log_path,
@@ -1041,7 +1293,7 @@ def main(argv=None):
             break
         task_id = row["id"]
         model = pick_model(row, models)
-        session_id = str(uuid.uuid4()) if args.agent == "claude" else ""  # agy names its conversation at the end
+        session_id = str(uuid.uuid4()) if args.agent == "claude" else ""  # agy and cursor name theirs as they run
         attempted.append(task_id)
         state["current"] = {
             "id": task_id,
@@ -1076,7 +1328,7 @@ def main(argv=None):
     print(f"\n{len(attempted)} item(s) attempted. Run log: {log_path}")
     rel = os.path.relpath(log_path, PROJECT_ROOT).replace(os.sep, "/")
     print("Morning review, from the repo root:")
-    ask = "agy -i" if args.agent == "agy" else "claude"
+    ask = {"agy": "agy -i", "cursor": "agent"}.get(args.agent, "claude")
     print(f'  {ask} "Review the backlog batch log {rel}: walk me through each blocked or failed item."')
     return 0
 

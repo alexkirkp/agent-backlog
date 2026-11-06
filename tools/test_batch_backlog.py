@@ -90,6 +90,7 @@ class FakeSession:
         self.result_text, self.returncode, self.hang = result_text, returncode, hang
         self.transcript_text, self.stderr, self.commits = transcript_text, stderr, list(commits)
         self.denied = list(denied)  # agy only: the display names of actions it denied
+        self.cursor_events = []  # cursor only: events streamed before the reply
         self.prompt = ""
         self.ended = False
         self.pid = 1
@@ -116,6 +117,8 @@ class FakePopen:
         session = next(self.sessions)
         session.stdin = FakeStdin(session)
         session.wait = lambda timeout=None: self._wait(session)
+        if "--trust" in cmd:  # cursor: the prompt comes on stdin, the output is an NDJSON event stream
+            return self._cursor(session, kwargs)
         if "--session-id" not in cmd:  # agy: the prompt rides in argv and the payload has its own shape
             assert kwargs["stdin"] is subprocess.DEVNULL and cmd[-1].startswith("--print=")
             session.prompt = cmd[-1][len("--print=") :]
@@ -148,6 +151,35 @@ class FakePopen:
             at = (batch_backlog.now_utc() - timedelta(minutes=10)).isoformat()
             row = transcript_row("assistant", [{"type": "text", "text": session.transcript_text}], at)
             (projects / f"{session_id}.jsonl").write_text(row, encoding="utf-8")
+        return session
+
+    @staticmethod
+    def _cursor(session, kwargs):
+        assert kwargs["stdin"] is subprocess.PIPE
+        out = kwargs["stdout"]
+        events = [{"type": "system", "subtype": "init", "session_id": "chat-1", "model": "x"}]
+        events += session.cursor_events
+        if session.result_text is not None:
+            text = [{"type": "text", "text": session.result_text}]
+            events.append({"type": "assistant", "message": {"role": "assistant", "content": text}})
+            if not session.hang and session.returncode == 0:
+                usage = {"inputTokens": 20_000, "outputTokens": 5_000, "cacheReadTokens": 30_000, "cacheWriteTokens": 0}
+                events.append(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "result": session.result_text,
+                        "session_id": "chat-1",
+                        "usage": usage,
+                    }
+                )
+        out.write("".join(json.dumps(e) + "\n" for e in events))
+        out.flush()
+        if session.hang:  # it went quiet ten minutes ago
+            old = batch_backlog.now_utc().timestamp() - 600
+            os.utime(out.name, (old, old))
+        kwargs["stderr"].write(session.stderr)
         return session
 
     @staticmethod
@@ -637,8 +669,23 @@ def test_agy_rejects_claude_only_options(tmp_path, capsys, extra, message):
         ({}, {"claude", "agy"}, "claude"),
         ({}, {"agy"}, "agy"),
         ({}, set(), "claude"),
+        ({"BACKLOG_AGENT": "cursor"}, {"claude"}, "cursor"),
+        ({}, {"agent"}, "cursor"),
+        ({}, {"cursor-agent"}, "cursor"),
+        ({}, {"cursor"}, "claude"),
     ],
-    ids=["env-wins", "env-normalized", "bad-env-ignored", "both-on-path", "agy-only", "neither"],
+    ids=[
+        "env-wins",
+        "env-normalized",
+        "bad-env-ignored",
+        "both-on-path",
+        "agy-only",
+        "neither",
+        "env-cursor",
+        "cursor-agent-binary",
+        "cursor-legacy-binary",
+        "cursor-editor-is-not-the-agent",
+    ],
 )
 def test_default_agent(env, on_path, expected):
     assert batch_backlog.default_agent(env, lambda name: name if name in on_path else None) == expected
@@ -676,3 +723,152 @@ def test_status_for_an_agy_batch_says_the_conversation_is_not_readable_live(tmp_
     assert "· agy ·" in view and "9k tok" in view
     assert "agy session known when it ends" in view and "can't be read live" in view
     assert "B3.8 claude-opus-5-5-medium" in view
+
+
+# --- the cursor backend -------------------------------------------------------------------------
+
+CURSOR_MODELS = [
+    "auto",
+    "composer-2",
+    "claude-sonnet-5",
+    "claude-sonnet-5-thinking",
+    "claude-opus-5-5",
+    "claude-opus-4-8",
+    "gemini-3.8-flash",
+    "gpt-5.5",
+    "sonnet-4-thinking",
+]
+
+
+def run_cursor(tmp_path, sessions, *extra):
+    with patch.object(batch_backlog, "cursor_model_ids", return_value=CURSOR_MODELS):
+        return run_main(tmp_path, sessions, "--agent", "cursor", "--cli", "agent", *extra)
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("Gemini 3.8 Flash", "gemini-3.8-flash"),
+        ("Claude Sonnet 5", "claude-sonnet-5"),  # the exact id beats the -thinking variant
+        ("Claude Opus 5.5", "claude-opus-5-5"),
+        ("Claude Opus 5", "claude-opus-5-5"),
+        ("Claude Opus 4", "claude-opus-4-8"),
+        ("Claude Sonnet 4", "sonnet-4-thinking"),  # a short-form id still matches by family
+        ("Auto", "auto"),
+        ("Claude Fable 5.1", None),
+        ("the athlete", None),
+    ],
+)
+def test_cursor_resolver_maps_guide_names_to_listed_ids(name, expected):
+    assert batch_backlog.cursor_resolver(CURSOR_MODELS)(name) == expected
+
+
+def test_cursor_model_ids_reads_id_shaped_first_words():
+    out = (
+        "\x1b[1mAvailable models\x1b[0m\n\n"
+        "auto - Auto  (current)\n"
+        "  claude-sonnet-5-thinking - Claude Sonnet 5 Thinking\n"
+        "claude-opus-5-5 - Claude Opus 5.5 [2m(current, default)[0m\n"
+        "Tip: use --model <id> to switch\n"
+    )
+    done = subprocess.CompletedProcess(["agent", "models"], 0, stdout=out, stderr="")
+    with patch("batch_backlog.subprocess.run", return_value=done):
+        assert batch_backlog.cursor_model_ids("agent") == ["auto", "claude-sonnet-5-thinking", "claude-opus-5-5"]
+
+
+def test_cursor_items_stream_with_the_prompt_on_stdin_and_force(tmp_path):
+    sessions = [fake_session("BATCH_RESULT: done — one"), fake_session("BATCH_RESULT: blocked — two")]
+    run, log = run_cursor(tmp_path, sessions, "--tier-model", "workhorse=auto")
+    assert run.call_count == 2 and "B2.101" in sessions[0].prompt and "B3.8" in sessions[1].prompt
+    first, second = (call.args[0] for call in run.call_args_list)
+    assert first[:6] == ["agent", "-p", "--output-format", "stream-json", "--force", "--trust"]
+    assert first[first.index("--model") + 1] == "auto"
+    assert second[second.index("--model") + 1] == "claude-opus-5-5"
+    assert "| B2.101 | auto | done |" in log and "| B3.8 | claude-opus-5-5 | blocked |" in log and "`chat-1`" in log
+    assert "55k tok" in log
+    assert "Agent `cursor`" in log and "permission mode `force`" in log
+    assert list((tmp_path / "logs").glob("*/B2.101.jsonl"))
+    (state_path,) = (tmp_path / "logs").glob("*/state.json")
+    assert json.loads(state_path.read_text(encoding="utf-8"))["cursor_models"] == CURSOR_MODELS
+
+
+def test_a_cursor_failure_without_a_result_event_stops_the_batch(tmp_path):
+    run, log = run_cursor(tmp_path, [fake_session(None, returncode=1, stderr="Error: not logged in")])
+    assert run.call_count == 1
+    assert "| B2.101 | claude-sonnet-5 | error |" in log and "without a result event" in log
+
+
+def test_a_lingering_cursor_session_is_ended_once_its_result_line_sits_quiet(tmp_path):
+    lingering = fake_session("BATCH_RESULT: done — added it", hang=True, commits=["a1 feat: x (B2.101)"])
+    run, log = run_cursor(tmp_path, [lingering, fake_session("BATCH_RESULT: blocked — two")])
+    assert lingering.ended and run.call_count == 2
+    assert "| B2.101 | claude-sonnet-5 | done |" in log and "added it" in log
+
+
+def test_a_cursor_tool_call_after_the_result_line_clears_the_hold(tmp_path):
+    path = tmp_path / "s.jsonl"
+    said = {"type": "assistant", "message": {"content": [{"type": "text", "text": "BATCH_RESULT: done — x"}]}}
+    call = {"type": "tool_call", "subtype": "started", "tool_call": {"shellToolCall": {"args": {"command": "git status"}}}}
+    path.write_text(json.dumps(said) + "\n", encoding="utf-8")
+    later = batch_backlog.now_utc() + timedelta(minutes=10)
+    assert batch_backlog.stream_held_result(str(path), later, 3) == "BATCH_RESULT: done — x"
+    assert batch_backlog.stream_held_result(str(path), batch_backlog.now_utc(), 3) is None  # not quiet yet
+    path.write_text(json.dumps(said) + "\n" + json.dumps(call) + "\n", encoding="utf-8")
+    assert batch_backlog.stream_held_result(str(path), later, 3) is None
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [(("--permission-mode", "auto"), "is `force`"), (("--max-budget-usd", "5"), "claude-only")],
+    ids=["other-permission-mode", "budget"],
+)
+def test_cursor_rejects_options_it_cannot_honor(tmp_path, capsys, extra, message):
+    backlog = tmp_path / "BACKLOG.md"
+    backlog.write_text(BACKLOG, encoding="utf-8")
+    with pytest.raises(SystemExit):
+        batch_backlog.main(["--agent", "cursor", "--dry-run", "--backlog", str(backlog), *extra])
+    assert message in capsys.readouterr().err
+
+
+def test_status_for_a_cursor_batch_reads_its_event_stream(tmp_path):
+    run_dir = tmp_path / "20261106-0100"
+    run_dir.mkdir()
+    now = batch_backlog.now_utc().isoformat()
+    state = {
+        "stamp": "20261106-0100",
+        "pid": 0,
+        "agent": "cursor",
+        "cursor_models": CURSOR_MODELS,
+        "started": now,
+        "base": "",
+        "log": "",
+        "model": "",
+        "tier_models": [],
+        "only": [],
+        "include_human": False,
+        "instructions": "",
+        "current": {"id": "B2.101", "model": "claude-sonnet-5", "session": "", "started": now},
+        "finished": [],
+        "ended": None,
+        "stop_reason": "",
+    }
+    (run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "chat-9"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "Reading the entry."}]}},
+        {"type": "tool_call", "subtype": "started", "tool_call": {"readToolCall": {"args": {"path": "BACKLOG.md"}}}},
+        {"type": "tool_call", "subtype": "completed", "tool_call": {"readToolCall": {"result": {"success": {}}}}},
+        {"type": "tool_call", "subtype": "started", "tool_call": {"shellToolCall": {"args": {"command": "pytest -q"}}}},
+        {"type": "tool_call", "subtype": "completed", "tool_call": {"shellToolCall": {"result": {"rejected": {}}}}},
+        {"type": "tool_call", "subtype": "started", "tool_call": {"tool": {"case": "grepToolCall", "value": {"args": {"pattern": "TODO"}}}}},
+        {"type": "tool_call", "subtype": "completed", "tool_call": {"grepToolCall": {"result": {"permissionDenied": {}}}}},
+    ]
+    (run_dir / "B2.101.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+    backlog = tmp_path / "BACKLOG.md"
+    backlog.write_text(BACKLOG, encoding="utf-8")
+    with patch.object(batch_backlog, "git", return_value=""), patch.object(batch_backlog, "check", return_value=([], None)):
+        view = batch_backlog.render_status(str(run_dir), str(backlog))
+    assert "· cursor ·" in view and "cursor session chat-9" in view
+    assert "1 turns, 3 tool calls" in view and "> Read BACKLOG.md" in view and "> Shell pytest -q" in view
+    assert "> Grep TODO" in view and "Rejected or denied so far: 2" in view and "Last said: Reading the entry." in view
+    assert "B3.8 claude-opus-5-5" in view

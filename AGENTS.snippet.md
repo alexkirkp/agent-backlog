@@ -28,7 +28,8 @@ edit the same checkout at once; drop them otherwise.
   need to scan `COMPLETED.md` to allocate an ID), and must pass after any backlog edit.
 * **Unattended runs:** `python tools/batch_backlog.py` works the 📋 rows one per fresh `claude -p` session
   (`--dry-run` previews, `--status --wait` monitors). In Antigravity, add `--agent agy` when starting or
-  previewing a batch so each item runs in `agy -p` (`--status` reads the agent from the batch). Pass batch-specific guidance with
+  previewing a batch so each item runs in `agy -p`; in Cursor, add `--agent cursor` so each runs in
+  `agent -p` (`--status` reads the agent from the batch). Pass batch-specific guidance with
   `--instructions "..."` or `--instructions-file PATH`; it's appended to every item's prompt.
   Don't hand-roll a loop for this.
 * **Shared working tree:** other agents and people may edit the backlog at the same time. A row
