@@ -86,9 +86,10 @@ def test_prompt_names_the_item_and_the_result_line():
 class FakeSession:
     """One fake `claude -p`: what it prints, how it exits, and whether it lingers after finishing."""
 
-    def __init__(self, result_text, returncode=0, hang=False, transcript_text=None, stderr="", commits=()):
+    def __init__(self, result_text, returncode=0, hang=False, transcript_text=None, stderr="", commits=(), denied=()):
         self.result_text, self.returncode, self.hang = result_text, returncode, hang
         self.transcript_text, self.stderr, self.commits = transcript_text, stderr, list(commits)
+        self.denied = list(denied)  # agy only: the display names of actions it denied
         self.prompt = ""
         self.ended = False
         self.pid = 1
@@ -114,6 +115,22 @@ class FakePopen:
     def __call__(self, cmd, **kwargs):
         session = next(self.sessions)
         session.stdin = FakeStdin(session)
+        session.wait = lambda timeout=None: self._wait(session)
+        if "--session-id" not in cmd:  # agy: the prompt rides in argv and the payload has its own shape
+            assert kwargs["stdin"] is subprocess.DEVNULL and cmd[-1].startswith("--print=")
+            session.prompt = cmd[-1][len("--print=") :]
+            if session.result_text is not None and not session.hang:
+                payload = {
+                    "conversation_id": "conv-1",
+                    "status": "SUCCESS",
+                    "response": "" if session.denied else session.result_text,
+                    "usage": {"total_tokens": 42_000},
+                }
+                if session.denied:
+                    payload["denied_actions"] = [{"action": "command", "display_name": d} for d in session.denied]
+                kwargs["stdout"].write(json.dumps(payload))
+            kwargs["stderr"].write(session.stderr)
+            return session
         session_id = cmd[cmd.index("--session-id") + 1]
         if session.result_text is not None:
             payload = {
@@ -131,7 +148,6 @@ class FakePopen:
             at = (batch_backlog.now_utc() - timedelta(minutes=10)).isoformat()
             row = transcript_row("assistant", [{"type": "text", "text": session.transcript_text}], at)
             (projects / f"{session_id}.jsonl").write_text(row, encoding="utf-8")
-        session.wait = lambda timeout=None: self._wait(session)
         return session
 
     @staticmethod
@@ -165,7 +181,7 @@ def run_main(tmp_path, sessions, *extra):
         patch.object(batch_backlog, "commits_since", side_effect=commits_since),
         patch("batch_backlog.subprocess.Popen", side_effect=FakePopen(sessions, config_dir)) as run,
     ):
-        batch_backlog.main(["--backlog", str(backlog), "--claude", "claude", *extra])
+        batch_backlog.main(["--backlog", str(backlog), "--agent", "claude", "--cli", "claude", *extra])
     (log,) = (tmp_path / "logs").glob("*.md")
     return run, log.read_text(encoding="utf-8")
 
@@ -512,3 +528,151 @@ def test_brief_warns_off_heredocs_and_untouched_file_failures():
     prompt = batch_backlog.build_prompt("B2.1")
     assert "file-writing tool" in prompt and "heredoc" in prompt
     assert "did not touch" in prompt and "one line" in prompt
+
+
+# --- the agy backend ----------------------------------------------------------------------------
+
+AGY_MODELS = [
+    "gemini-4-argon-medium",
+    "gemini-4-argon-high",
+    "gemini-3.8-flash-high",
+    "gemini-3.8-flash-medium",
+    "claude-opus-5-5-low",
+    "claude-opus-5-5-medium",
+    "claude-sonnet-5-5-medium",
+]
+
+
+def run_agy(tmp_path, sessions, *extra):
+    with patch.object(batch_backlog, "agy_model_ids", return_value=AGY_MODELS):
+        return run_main(tmp_path, sessions, "--agent", "agy", "--cli", "agy", *extra)
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("Gemini 3.8 Flash", "gemini-3.8-flash-medium"),
+        ("Gemini 4 Argon", "gemini-4-argon-medium"),
+        ("Claude Sonnet 5", "claude-sonnet-5-5-medium"),
+        ("Claude Opus 5.5", "claude-opus-5-5-medium"),
+        ("Claude Fable 5.1", None),
+        ("the athlete", None),
+    ],
+)
+def test_agy_resolver_maps_guide_names_to_listed_ids(name, expected):
+    assert batch_backlog.agy_resolver(AGY_MODELS)(name) == expected
+
+
+def test_agy_tiers_take_the_first_name_agy_offers():
+    models = batch_backlog.tier_models(BACKLOG, resolve=batch_backlog.agy_resolver(AGY_MODELS))
+    assert models == {
+        "planner": "claude-opus-5-5-medium",  # no Fable on agy, so the next name in the tier
+        "frontier": "claude-opus-5-5-medium",
+        "workhorse": "claude-sonnet-5-5-medium",
+        "fast": "gemini-3.8-flash-medium",
+    }
+
+
+def test_agy_model_ids_reads_the_first_column():
+    out = (
+        "Fetching available models...\n"
+        "gemini-4-argon-medium\tGemini 4 Argon (Medium)\n"
+        "claude-opus-5-5-high\tClaude Opus 5.5 (High)\n"
+    )
+    done = subprocess.CompletedProcess(["agy", "models"], 0, stdout=out, stderr="")
+    with patch("batch_backlog.subprocess.run", return_value=done):
+        assert batch_backlog.agy_model_ids("agy") == ["gemini-4-argon-medium", "claude-opus-5-5-high"]
+
+
+def test_agy_items_run_with_the_prompt_in_argv_and_log_tokens(tmp_path):
+    sessions = [fake_session("BATCH_RESULT: done — one"), fake_session("BATCH_RESULT: blocked — two")]
+    run, log = run_agy(tmp_path, sessions)
+    assert run.call_count == 2 and "B2.101" in sessions[0].prompt and "B3.8" in sessions[1].prompt
+    first = run.call_args_list[0].args[0]
+    assert first[first.index("--model") + 1] == "claude-sonnet-5-5-medium"
+    assert "--dangerously-skip-permissions" not in first
+    assert "| B2.101 | claude-sonnet-5-5-medium | done |" in log and "42k tok" in log and "`conv-1`" in log
+    assert "Agent `agy`" in log and "permission mode `settings`" in log
+    (state_path,) = (tmp_path / "logs").glob("*/state.json")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["agent"] == "agy" and state["agy_models"] == AGY_MODELS
+
+
+def test_agy_skip_permission_mode_passes_the_flag(tmp_path):
+    run, _ = run_agy(tmp_path, [fake_session("BATCH_RESULT: done — x")], "--permission-mode", "skip", "--limit", "1")
+    assert "--dangerously-skip-permissions" in run.call_args.args[0]
+
+
+def test_an_agy_denial_is_an_error_that_names_the_fix_and_stops_the_batch(tmp_path):
+    denied = fake_session("BATCH_RESULT: done — x", denied=["RunCommand"])
+    run, log = run_agy(tmp_path, [denied])
+    assert run.call_count == 1
+    assert "| error |" in log and "agy denied RunCommand" in log and "command(*)" in log
+
+
+def test_an_agy_empty_response_is_an_error(tmp_path):
+    run, log = run_agy(tmp_path, [fake_session("")])
+    assert run.call_count == 1 and "empty response" in log
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [(("--permission-mode", "auto"), "settings` or `skip"), (("--max-budget-usd", "5"), "claude-only")],
+    ids=["claude-permission-mode", "budget"],
+)
+def test_agy_rejects_claude_only_options(tmp_path, capsys, extra, message):
+    backlog = tmp_path / "BACKLOG.md"
+    backlog.write_text(BACKLOG, encoding="utf-8")
+    with pytest.raises(SystemExit):
+        batch_backlog.main(["--agent", "agy", "--dry-run", "--backlog", str(backlog), *extra])
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "env, on_path, expected",
+    [
+        ({"BACKLOG_AGENT": "agy"}, {"claude", "agy"}, "agy"),
+        ({"BACKLOG_AGENT": "AGY "}, set(), "agy"),
+        ({"BACKLOG_AGENT": "bogus"}, {"agy"}, "agy"),
+        ({}, {"claude", "agy"}, "claude"),
+        ({}, {"agy"}, "agy"),
+        ({}, set(), "claude"),
+    ],
+    ids=["env-wins", "env-normalized", "bad-env-ignored", "both-on-path", "agy-only", "neither"],
+)
+def test_default_agent(env, on_path, expected):
+    assert batch_backlog.default_agent(env, lambda name: name if name in on_path else None) == expected
+
+
+def test_status_for_an_agy_batch_says_the_conversation_is_not_readable_live(tmp_path):
+    run_dir = tmp_path / "20261106-0100"
+    run_dir.mkdir()
+    now = batch_backlog.now_utc().isoformat()
+    state = {
+        "stamp": "20261106-0100",
+        "pid": 0,
+        "agent": "agy",
+        "agy_models": AGY_MODELS,
+        "started": now,
+        "base": "",
+        "log": "",
+        "model": "",
+        "tier_models": [],
+        "only": [],
+        "include_human": False,
+        "instructions": "",
+        "current": {"id": "B2.101", "model": "gemini-3.8-flash-medium", "session": "", "started": now},
+        "finished": [
+            {"id": "B1.1", "model": "m", "result": "done", "summary": "s", "commits": [], "cost": None, "tokens": 9000}
+        ],
+        "ended": None,
+        "stop_reason": "",
+    }
+    (run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    backlog = tmp_path / "BACKLOG.md"
+    backlog.write_text(BACKLOG, encoding="utf-8")
+    with patch.object(batch_backlog, "git", return_value=""), patch.object(batch_backlog, "check", return_value=([], None)):
+        view = batch_backlog.render_status(str(run_dir), str(backlog))
+    assert "· agy ·" in view and "9k tok" in view
+    assert "agy session known when it ends" in view and "can't be read live" in view
+    assert "B3.8 claude-opus-5-5-medium" in view

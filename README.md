@@ -60,7 +60,7 @@ Each task has a **session-sized entry** focused on *why* it matters and *what "d
    spikes/                     On-demand architecture & research notes
    tools/check_backlog.py      Zero-dependency linter (Python 3.8+, stdlib only)
    ```
-2. **Add agent instructions:** Paste `AGENTS.snippet.md` into your `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, or `.cursor/rules/*.mdc`.
+2. **Add agent instructions:** Paste `AGENTS.snippet.md` into your `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, or `.cursor/rules/*.mdc`. Antigravity (`agy`) reads `AGENTS.md` and ignores `CLAUDE.md`; to serve both, put the snippet in `AGENTS.md` and have `CLAUDE.md` say `@AGENTS.md`.
 3. **Validate (and get next free IDs):**
    ```sh
    $ python tools/check_backlog.py
@@ -69,7 +69,7 @@ Each task has a **session-sized entry** focused on *why* it matters and *what "d
 
 ### Working the queue unattended (optional)
 
-`tools/batch_backlog.py` runs the `📋 Planned` rows one at a time, top to bottom, each in a fresh headless `claude -p` session, so nothing piles up in one long chat. Each session works its task as far as it can, choosing sensible defaults instead of stopping to ask. A finished task is tested, moved to `COMPLETED.md` and committed. When pieces genuinely need a human, the session commits what it finished, flips the row to `⏸️ Gated` and lists what's left as **Open questions**. Rows whose Model Fit names a human, whose `Depends on:` isn't done, or whose target files have uncommitted edits are skipped.
+`tools/batch_backlog.py` runs the `📋 Planned` rows one at a time, top to bottom, each in a fresh headless `claude -p` or `agy -p` session, so nothing piles up in one long chat. Each session works its task as far as it can, choosing sensible defaults instead of stopping to ask. A finished task is tested, moved to `COMPLETED.md` and committed. When pieces genuinely need a human, the session commits what it finished, flips the row to `⏸️ Gated` and lists what's left as **Open questions**. Rows whose Model Fit names a human, whose `Depends on:` isn't done, or whose target files have uncommitted edits are skipped.
 
 ```sh
 python tools/batch_backlog.py --dry-run                      # preview the queue and the prompt
@@ -79,6 +79,14 @@ python tools/batch_backlog.py --instructions-file batch_notes.md           # sam
 python tools/batch_backlog.py --status --wait                # monitor; blocks until the running item changes
 ```
 
-Run logs land in `.backlog_batch/` (gitignored). Needs the `claude` CLI on PATH; the script itself is stdlib-only. Tiers route to models via `--tier-model` or a routing-guide line like `* **Workhorse** (Claude Sonnet 5): ...`; `--model` overrides both.
+Run logs land in `.backlog_batch/` (gitignored). Needs the `claude` or `agy` CLI on PATH; the script itself is stdlib-only. Tiers route to models via `--tier-model` or a routing-guide line like `* **Workhorse** (Claude Sonnet 5): ...`; `--model` overrides both.
+
+**With Antigravity:** pass `--agent agy` (or set `BACKLOG_AGENT=agy`; without either, the runner uses `claude` when it's on PATH, else `agy`). Guide names such as `Gemini 3.8 Flash` or `Claude Opus 5.5` resolve against `agy models` (the `-medium` variant by default), and `--tier-model fast=gemini-3.8-flash-high` takes any id it lists. One setup step first: headless agy can't ask for permission, and its allow-rules match whole commands only, so add this to `~/.gemini/antigravity-cli/settings.json`:
+
+```json
+{ "permissions": { "allow": ["command(*)"] } }
+```
+
+That lets every agy CLI session run shell commands without asking, interactive ones included. If you'd rather not, pass `--permission-mode skip` per batch (agy's `--dangerously-skip-permissions`). Without either, the first item stops with an error naming both fixes. agy reports tokens rather than dollars, and its conversations can't be read live, so `--status` shows the tree and commits for the running item but not its tool calls, and a session ends on its own or at `--timeout-min`. Reopen one with `agy --conversation <id>`.
 
 `tools/check_backlog.py` exits `1` on table-to-body drift, entries over 45 non-blank lines, broken anchors or `spikes/` links, duplicate/retired IDs, or out-of-order `§N` milestones in `COMPLETED.md`. (Adopting on an existing ledger? Add `<!-- backlog-check: legacy-through=N -->` to `COMPLETED.md` to exempt milestones `§N` and earlier.)

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Work BACKLOG.md's 📋 Planned rows unattended, one fresh headless Claude Code session each.
+"""Work BACKLOG.md's 📋 Planned rows unattended, one fresh headless agent session each.
 
-Each item runs as its own `claude -p` session, so no context carries over between items and
-nothing piles up in one long chat. Items run one at a time, top to bottom in the summary table,
+Each item runs as its own `claude -p` (Claude Code) or `agy -p` (Antigravity) session, so no context
+carries over between items and nothing piles up in one long chat. `--agent` picks the CLI; without
+it, `$BACKLOG_AGENT`, else `claude` when it is on PATH, else `agy`. Items run one at a time, top to bottom in the summary table,
 because they share the working tree. BACKLOG.md is re-read before each pick, so a row that an
 earlier item finished, blocked or reordered is seen as it is now.
 
@@ -10,8 +11,8 @@ Every session gets the same brief: work the item as far as it can (tests green, 
 COMPLETED.md, committed), and when pieces need a human, commit what's done, flip the row to ⏸️ and
 list what's left as **Open questions**. The
 reply ends in a `BATCH_RESULT:` line, which goes into a markdown run log under
-`.backlog_batch/` with the commits, cost and session id (`claude --resume <id>` reopens
-a session). The raw JSON of each session sits next to the log.
+`.backlog_batch/` with the commits, cost and session id (`claude --resume <id>` or
+`agy --conversation <id>` reopens a session). The raw JSON of each session sits next to the log.
 
 A session that sits quiet for `--idle-min` after its `BATCH_RESULT:` line is ended and that line is
 its result (a background Monitor can keep a finished `claude -p` alive). A session that dies or is
@@ -36,12 +37,20 @@ is happening (idle time, recent tool calls, errors, permission denials, repeated
 left uncommitted, the backlog check, the queue) and leaves the call on whether it's healthy to
 whoever reads it.
 
-Usage: python tools/batch_backlog.py [--dry-run] [--limit N] [--only B1.1,B1.2]
+With `--agent agy` the differences are: the routing guide's model names (Gemini or Claude) resolve
+against `agy models`; agy reports tokens, not cost; its conversations are not readable live, so the
+idle-after-result check and the transcript part of `--status` are Claude-only (agy sessions end on
+their own or at `--timeout-min`). agy cannot ask for permission headless: give it `command(*)` under
+`permissions.allow` in `~/.gemini/antigravity-cli/settings.json` (its rules match whole commands
+only, so narrower rules don't cover a batch), or pass `--permission-mode skip`. A session that hits a
+denial is an error and stops the batch.
+
+Usage: python tools/batch_backlog.py [--agent claude|agy] [--dry-run] [--limit N] [--only B1.1,B1.2]
        [--model M] [--tier-model workhorse=sonnet] [--permission-mode auto] [--max-budget-usd X]
        [--timeout-min N] [--instructions TEXT] [--instructions-file PATH]
        python tools/batch_backlog.py --status [STAMP] [--wait]
 
-Standard library only, Python 3.8+ (plus the `claude` CLI on PATH). Run it from the repo root.
+Standard library only, Python 3.8+ (plus the `claude` or `agy` CLI on PATH). Run it from the repo root.
 """
 
 import argparse
@@ -71,6 +80,9 @@ DEFAULT_BACKLOG = os.path.join(PROJECT_ROOT, "BACKLOG.md")
 LOG_ROOT = os.path.join(PROJECT_ROOT, ".backlog_batch")
 MAX_LINES = 45  # check_backlog's entry cap, for the status view's backlog check
 STATE_FILE = "state.json"
+AGENTS = ("claude", "agy")
+AGY_SETTINGS = "~/.gemini/antigravity-cli/settings.json"
+AGY_EFFORT = "medium"  # agy model ids carry an effort suffix; a guide name without one gets this
 MODEL_FAMILIES = ("fable", "opus", "sonnet", "haiku")
 GUIDE_TIER = re.compile(r"^\* \*\*([A-Za-z]+)\*\* \(([^)]*)\)")
 DENIAL_RE = re.compile(r"permission|denied|not allowed", re.IGNORECASE)
@@ -224,12 +236,61 @@ def newly_pickable(text, skipped_ids):
     ]
 
 
-def tier_models(text, overrides=()):
-    """Tier → CLI model alias: the first Claude model each tier lists in the routing guide's brackets.
+def claude_alias(name):
+    """The Claude Code alias for a guide model name (`Claude Sonnet 5` → `sonnet`); None for others.
 
-    The family alias (`sonnet`, `opus`) always resolves to that family's latest model, so a guide
-    that still names an older version routes to the current one. `overrides` (`TIER=ALIAS`
-    strings, from `--tier-model`) win over the guide.
+    The family alias always resolves to that family's latest model, so a guide that still names an
+    older version routes to the current one.
+    """
+    words = name.lower().split()
+    if len(words) > 1 and words[0] == "claude" and words[1] in MODEL_FAMILIES:
+        return words[1]
+    return None
+
+
+def agy_resolver(model_ids):
+    """A guide-name → agy model id function over the ids `agy models` lists.
+
+    `Gemini 3.8 Flash` → `gemini-3.8-flash-medium`; `Claude Sonnet 5` → `claude-sonnet-5-5-medium`
+    (a prefix match, dots and hyphens alike, preferring the `AGY_EFFORT` variant). None when agy
+    offers nothing that matches.
+    """
+
+    def norm(s):
+        return re.sub(r"[\s._]+", "-", s.strip().lower())
+
+    def resolve(name):
+        slug = norm(name)
+        if not slug:
+            return None
+        hits = [m for m in model_ids if norm(m) == slug or norm(m).startswith(slug + "-")]
+        preferred = [m for m in hits if m.endswith("-" + AGY_EFFORT)]
+        return (preferred or hits or [None])[0]
+
+    return resolve
+
+
+def agy_model_ids(cli):
+    """The model ids `agy models` lists (first column), or [] when it can't be run."""
+    try:
+        proc = subprocess.run(
+            [cli, "models"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("agy models failed: %s", e)
+        return []
+    ids = []
+    for line in proc.stdout.splitlines():
+        first = line.split("\t")[0].strip()
+        if "\t" in line and first and " " not in first:
+            ids.append(first)
+    return ids
+
+
+def tier_models(text, overrides=(), resolve=claude_alias):
+    """Tier → CLI model: the first model each tier lists in the routing guide's brackets that `resolve` maps.
+
+    `overrides` (`TIER=ALIAS` strings, from `--tier-model`) win over the guide.
     """
     models = {}
     for line in text.splitlines():
@@ -237,9 +298,9 @@ def tier_models(text, overrides=()):
         if not match:
             continue
         for name in match.group(2).split(","):
-            words = name.lower().split()
-            if len(words) > 1 and words[0] == "claude" and words[1] in MODEL_FAMILIES:
-                models[match.group(1).lower()] = words[1]
+            alias = resolve(name)
+            if alias:
+                models[match.group(1).lower()] = alias
                 break
     for item in overrides:
         tier, _, alias = item.partition("=")
@@ -307,13 +368,61 @@ def commits_since(base, task_id):
 
 
 def claude_command(args, model, session_id):
-    cmd = [args.claude, "-p", "--output-format", "json", "--permission-mode", args.permission_mode]
+    """`claude -p`; the prompt goes in on stdin."""
+    cmd = [args.cli, "-p", "--output-format", "json", "--permission-mode", args.permission_mode]
     cmd += ["--session-id", session_id]
     if model:
         cmd += ["--model", model]
     if args.max_budget_usd:
         cmd += ["--max-budget-usd", str(args.max_budget_usd)]
     return cmd
+
+
+def agy_command(args, model, prompt):
+    """`agy --print=<prompt>`: agy reads no prompt from stdin, and `=` keeps a prompt from being read as a flag."""
+    cmd = [args.cli, "--output-format", "json"]
+    if model:
+        cmd += ["--model", model]
+    if args.permission_mode == "skip":
+        cmd.append("--dangerously-skip-permissions")
+    return cmd + [f"--print={prompt}"]
+
+
+def claude_outcome(payload, returncode):
+    """`(reply, error, session, cost, tokens)` from `claude -p --output-format json`; reply None on failure."""
+    if not isinstance(payload, dict):
+        return None, "", None, None, None
+    session, cost = payload.get("session_id"), payload.get("total_cost_usd")
+    if returncode == 0 and not payload.get("is_error"):
+        return payload.get("result", ""), "", session, cost, None
+    return None, (payload.get("result") if payload.get("is_error") else "") or "", session, cost, None
+
+
+def agy_outcome(payload, returncode):
+    """`(reply, error, session, cost, tokens)` from `agy --output-format json`; reply None on failure.
+
+    agy reports `SUCCESS` even when a permission denial ended the turn with nothing done, so any
+    `denied_actions` or an empty response counts as failure.
+    """
+    if not isinstance(payload, dict):
+        return None, "", None, None, None
+    session = payload.get("conversation_id")
+    tokens = (payload.get("usage") or {}).get("total_tokens")
+    denied = payload.get("denied_actions") or []
+    if denied:
+        names = ", ".join(sorted({d.get("display_name") or d.get("action") or "?" for d in denied}))
+        error = (
+            f"agy denied {names} (it can't ask headless): allow command(*) under permissions.allow in "
+            f"{AGY_SETTINGS}, or pass --permission-mode skip"
+        )
+        return None, error, session, None, tokens
+    reply = payload.get("response") or ""
+    if returncode == 0 and payload.get("status") == "SUCCESS" and reply.strip():
+        return reply, "", session, None, tokens
+    return None, f"agy status {payload.get('status')}" + ("" if reply.strip() else ", empty response"), session, None, tokens
+
+
+OUTCOMES = {"claude": claude_outcome, "agy": agy_outcome}
 
 
 def held_result(transcript, now, idle_min):
@@ -373,25 +482,32 @@ def run_item(task_id, model, session_id, args, run_dir):
     deadline = time.monotonic() + args.timeout_min * 60
     idle_reply = None  # the held BATCH_RESULT reply once the session sat quiet and was ended
     timed_out = False
+    prompt = build_prompt(task_id, args.extra)
+    if args.agent == "agy":
+        cmd, stdin_text = agy_command(args, model, prompt), None
+    else:
+        cmd, stdin_text = claude_command(args, model, session_id), prompt
     with open(out_path, "w", encoding="utf-8") as out, open(err_path, "w", encoding="utf-8") as err:
         proc = subprocess.Popen(
-            claude_command(args, model, session_id),
+            cmd,
             cwd=PROJECT_ROOT,
-            stdin=subprocess.PIPE,
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
             stdout=out,
             stderr=err,
             text=True,
             encoding="utf-8",
         )
-        proc.stdin.write(build_prompt(task_id, args.extra))
-        proc.stdin.close()
+        if stdin_text is not None:
+            proc.stdin.write(stdin_text)
+            proc.stdin.close()
         while True:
             try:
                 proc.wait(timeout=args.poll_sec)
                 break
             except subprocess.TimeoutExpired:
                 pass
-            held = held_result(find_transcript(session_id), now_utc(), args.idle_min)
+            transcript = find_transcript(session_id) if args.agent == "claude" else None
+            held = held_result(transcript, now_utc(), args.idle_min)
             if held:
                 idle_reply = held
                 end_process(proc)
@@ -414,20 +530,21 @@ def run_item(task_id, model, session_id, args, run_dir):
         payload = json.loads(stdout)
     except json.JSONDecodeError:
         payload = None
-    if isinstance(payload, dict):
-        record["cost"] = payload.get("total_cost_usd")
-        record["session"] = payload.get("session_id") or session_id
+    reply, detail, session, cost, tokens = OUTCOMES[args.agent](payload, proc.returncode)
+    record["cost"] = cost
+    record["session"] = session or session_id
+    if tokens is not None:
+        record["tokens"] = tokens
 
     if idle_reply is not None:
         record["result"], record["summary"] = parse_result(idle_reply)
         record["summary"] = f"session ended {args.idle_min} min after its result line; {record['summary']}".strip(" ;")
     elif timed_out:
         record.update(result="timeout", summary=f"no reply after {args.timeout_min} min")
-    elif proc.returncode == 0 and isinstance(payload, dict) and not payload.get("is_error"):
-        record["result"], record["summary"] = parse_result(payload.get("result", ""))
+    elif reply is not None:
+        record["result"], record["summary"] = parse_result(reply)
     else:
-        detail = payload.get("result") if isinstance(payload, dict) and payload.get("is_error") else None
-        record["summary"] = (detail or f"exit {proc.returncode} without a result line").splitlines()[0][:200]
+        record["summary"] = (detail or f"exit {proc.returncode} without a result line").splitlines()[0][:300]
         if stderr.strip():
             record["summary"] += f" (stderr in {os.path.basename(err_path)})"
 
@@ -444,7 +561,8 @@ def run_item(task_id, model, session_id, args, run_dir):
 def log_header(path, stamp, args):
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"# Backlog batch {stamp}\n\n")
-        f.write(f"Branch `{git('rev-parse', '--abbrev-ref', 'HEAD')}`, permission mode `{args.permission_mode}`")
+        f.write(f"Agent `{args.agent}`, branch `{git('rev-parse', '--abbrev-ref', 'HEAD')}`")
+        f.write(f", permission mode `{args.permission_mode}`")
         f.write(f", model `{args.model}` for every item.\n\n" if args.model else ", models by Model Fit.\n\n")
         if args.extra:
             quoted = "".join(f"> {line}".rstrip() + "\n" for line in args.extra.splitlines())
@@ -460,8 +578,17 @@ def commit_note(record):
     return " [work committed]" if record.get("commits") else " [nothing committed]"
 
 
+def spend(record, empty=""):
+    """The record's cost in USD, or its token count when the CLI reports no cost (agy)."""
+    if isinstance(record.get("cost"), (int, float)):
+        return f"${record['cost']:.2f}"
+    if isinstance(record.get("tokens"), (int, float)):
+        return f"{record['tokens'] / 1000:.0f}k tok"
+    return empty
+
+
 def log_row(path, record):
-    cost = f"${record['cost']:.2f}" if isinstance(record.get("cost"), (int, float)) else ""
+    cost = spend(record)
     commits = "<br>".join(f"`{c}`" for c in record["commits"])
     summary = (record["summary"] + commit_note(record)).replace("|", "\\|")
     with open(path, "a", encoding="utf-8") as f:
@@ -671,9 +798,14 @@ def render_status(run_dir, backlog_path=DEFAULT_BACKLOG):
         status = "DIED: its process is gone and it recorded no end"
     tally = Counter(r["result"] for r in finished)
     spent = sum(r["cost"] for r in finished if isinstance(r.get("cost"), (int, float)))
+    tokens = sum(r["tokens"] for r in finished if isinstance(r.get("tokens"), (int, float)))
+    so_far = " + ".join(
+        part for part in (f"${spent:.2f}" if spent or not tokens else "", f"{tokens / 1000:.0f}k tok" if tokens else "") if part
+    )
     lines = [
-        f"Batch {state['stamp']} · {status} · {round((now - started).total_seconds() / 60)} min in",
-        f"Results: {', '.join(f'{n} {k}' for k, n in tally.items()) or 'none yet'} · ${spent:.2f} so far",
+        f"Batch {state['stamp']} · {state.get('agent', 'claude')} · {status} · "
+        f"{round((now - started).total_seconds() / 60)} min in",
+        f"Results: {', '.join(f'{n} {k}' for k, n in tally.items()) or 'none yet'} · {so_far} so far",
     ]
 
     problems = check(os.path.dirname(os.path.abspath(backlog_path)), MAX_LINES)[0]
@@ -688,7 +820,7 @@ def render_status(run_dir, backlog_path=DEFAULT_BACKLOG):
     if finished:
         lines.append("Finished:")
         for r in finished:
-            cost = f"${r['cost']:.2f}" if isinstance(r.get("cost"), (int, float)) else "-"
+            cost = spend(r, "-")
             lines.append(
                 f"  {r['id']} {r['model']} {r['result']} {r.get('minutes', '?')}m {cost} "
                 f"{len(r['commits'])}c — {one_line(r['summary'], 110)}{commit_note(r)}"
@@ -696,9 +828,13 @@ def render_status(run_dir, backlog_path=DEFAULT_BACKLOG):
 
     if current and not state.get("ended"):
         minutes = round((now - parse_utc(current["started"])).total_seconds() / 60)
-        lines.append(f"Current: {current['id']} ({current['model']}) {minutes} min, session {current['session']}")
-        transcript = find_transcript(current["session"])
-        if not transcript:
+        agent = state.get("agent", "claude")
+        session = current["session"] or "known when it ends"
+        lines.append(f"Current: {current['id']} ({current['model']}) {minutes} min, {agent} session {session}")
+        transcript = find_transcript(current["session"]) if agent == "claude" else None
+        if agent != "claude":
+            lines.append(f"  {agent} conversations can't be read live: judge it by the tree and commits above")
+        elif not transcript:
             lines.append("  no transcript yet")
         else:
             d = transcript_digest(transcript, now)
@@ -723,7 +859,8 @@ def render_status(run_dir, backlog_path=DEFAULT_BACKLOG):
         attempted = [r["id"] for r in finished] + ([current["id"]] if current else [])
         only = set(state.get("only") or [])
         queue = [r for r in planned_queue(text, attempted, state.get("include_human")) if not only or r["id"].upper() in only]
-        models = tier_models(text, state.get("tier_models") or ())
+        resolve = agy_resolver(state.get("agy_models") or []) if state.get("agent") == "agy" else claude_alias
+        models = tier_models(text, state.get("tier_models") or (), resolve)
         left = [f"{r['id']} {state.get('model') or model_for(r['model_fit'], models) or 'default'}" for r in queue]
         lines.append(f"Queue: {len(left)} left" + (f": {', '.join(left)}" if left else ""))
     return "\n".join(lines)
@@ -732,12 +869,27 @@ def render_status(run_dir, backlog_path=DEFAULT_BACKLOG):
 # --- the batch ----------------------------------------------------------------------------------
 
 
+def default_agent(env=None, which=shutil.which):
+    """`$BACKLOG_AGENT` when it names a known agent, else `claude` when it's on PATH, else `agy` when that is."""
+    env = os.environ if env is None else env
+    named = (env.get("BACKLOG_AGENT") or "").strip().lower()
+    if named in AGENTS:
+        return named
+    return next((a for a in AGENTS if which(a)), "claude")
+
+
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--agent",
+        choices=AGENTS,
+        default=default_agent(),
+        help="the CLI that works each item (default: $BACKLOG_AGENT, else claude if on PATH, else agy)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the queue and the prompt, run nothing")
     parser.add_argument(
         "--status",
@@ -764,7 +916,10 @@ def main(argv=None):
         help="route a Model Fit tier to a model alias, e.g. workhorse=sonnet (repeatable; wins over the routing guide)",
     )
     parser.add_argument(
-        "--permission-mode", default="auto", help="claude --permission-mode for every session (default: auto)"
+        "--permission-mode",
+        default=None,
+        help="claude: its --permission-mode (default: auto). agy: `settings` (default; the grants in its "
+        "settings.json) or `skip` (--dangerously-skip-permissions)",
     )
     parser.add_argument(
         "--instructions",
@@ -780,7 +935,7 @@ def main(argv=None):
         metavar="PATH",
         help="a file of extra instructions appended to every item's prompt (repeatable; for multi-line text)",
     )
-    parser.add_argument("--max-budget-usd", type=float, default=0, help="per-item spend cap (default: none)")
+    parser.add_argument("--max-budget-usd", type=float, default=0, help="claude only: per-item spend cap (default: none)")
     parser.add_argument("--timeout-min", type=int, default=120, help="per-item wall clock cap (default: 120)")
     parser.add_argument(
         "--idle-min",
@@ -790,12 +945,23 @@ def main(argv=None):
     )
     parser.add_argument("--poll-sec", type=float, default=15, help="how often a running session is checked")
     parser.add_argument("--backlog", default=DEFAULT_BACKLOG, help="the backlog file (default: BACKLOG.md at the repo root)")
-    parser.add_argument("--claude", default=shutil.which("claude") or "claude", help="the claude executable")
+    parser.add_argument(
+        "--cli", "--claude", dest="cli", default=None, help="the agent's executable (default: `claude` or `agy` on PATH)"
+    )
     args = parser.parse_args(argv)
     try:
         args.extra = extra_instructions(args.instructions, args.instructions_file)
     except OSError as e:
         parser.error(f"--instructions-file: {e}")
+    args.cli = args.cli or shutil.which(args.agent) or args.agent
+    if args.agent == "agy":
+        args.permission_mode = args.permission_mode or "settings"
+        if args.permission_mode not in ("settings", "skip"):
+            parser.error("--permission-mode for agy is `settings` or `skip`")
+        if args.max_budget_usd:
+            parser.error("--max-budget-usd is claude-only: agy has no spend cap")
+    else:
+        args.permission_mode = args.permission_mode or "auto"
 
     if args.status is not None:
         run_dir = latest_run_dir(args.status or None)
@@ -805,19 +971,23 @@ def main(argv=None):
         return 0
 
     only = {i.strip().upper() for i in args.only.split(",") if i.strip()}
+    agy_models = agy_model_ids(args.cli) if args.agent == "agy" and not args.model else []
+    resolve = agy_resolver(agy_models) if args.agent == "agy" else claude_alias
 
     def queue(attempted):
         """The rows still to run, the tier → model map and the backlog text, all as the backlog is now."""
         with open(args.backlog, encoding="utf-8") as f:
             text = f.read()
         rows = planned_queue(text, attempted, args.include_human)
-        return [r for r in rows if not only or r["id"].upper() in only], tier_models(text, args.tier_model), text
+        models = tier_models(text, args.tier_model, resolve)
+        return [r for r in rows if not only or r["id"].upper() in only], models, text
 
     def pick_model(row, models):
         return args.model or model_for(row["model_fit"], models)
 
     if args.dry_run:
         rows, models, text = queue(())
+        print(f"Agent: {args.agent} ({args.cli}), permission mode {args.permission_mode}")
         print(f"{len(rows)} planned item(s), in order:")
         table, dirty, ahead = parse_backlog(text)[0], dirty_paths(), []
         for row in rows:
@@ -840,6 +1010,8 @@ def main(argv=None):
     state = {
         "stamp": stamp,
         "pid": os.getpid(),
+        "agent": args.agent,
+        "agy_models": agy_models,
         "started": now_utc().isoformat(),
         "base": git("rev-parse", "HEAD"),
         "log": log_path,
@@ -869,7 +1041,7 @@ def main(argv=None):
             break
         task_id = row["id"]
         model = pick_model(row, models)
-        session_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4()) if args.agent == "claude" else ""  # agy names its conversation at the end
         attempted.append(task_id)
         state["current"] = {
             "id": task_id,
@@ -904,7 +1076,8 @@ def main(argv=None):
     print(f"\n{len(attempted)} item(s) attempted. Run log: {log_path}")
     rel = os.path.relpath(log_path, PROJECT_ROOT).replace(os.sep, "/")
     print("Morning review, from the repo root:")
-    print(f'  claude "Review the backlog batch log {rel}: walk me through each blocked or failed item."')
+    ask = "agy -i" if args.agent == "agy" else "claude"
+    print(f'  {ask} "Review the backlog batch log {rel}: walk me through each blocked or failed item."')
     return 0
 
 

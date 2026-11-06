@@ -27,7 +27,8 @@ edit the same checkout at once; drop them otherwise.
   prints the next available `BN.x` ID per tier and the next `§N` milestone number (so you don't
   need to scan `COMPLETED.md` to allocate an ID), and must pass after any backlog edit.
 * **Unattended runs:** `python tools/batch_backlog.py` works the 📋 rows one per fresh `claude -p` session
-  (`--dry-run` previews, `--status --wait` monitors). Pass batch-specific guidance with
+  (`--dry-run` previews, `--status --wait` monitors). In Antigravity, add `--agent agy` when starting or
+  previewing a batch so each item runs in `agy -p` (`--status` reads the agent from the batch). Pass batch-specific guidance with
   `--instructions "..."` or `--instructions-file PATH`; it's appended to every item's prompt.
   Don't hand-roll a loop for this.
 * **Shared working tree:** other agents and people may edit the backlog at the same time. A row
